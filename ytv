@@ -617,7 +617,7 @@ def run_fzf(
         "--preview-window=up:4:wrap",
     ]
     if start_pos > 0:
-        cmd.append(f"--bind=start:pos({start_pos})")
+        cmd.append(f"--bind=load:pos({start_pos})")
     try:
         r = subprocess.run(cmd, input=lines, capture_output=True, text=True)
     except FileNotFoundError:
