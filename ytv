@@ -759,19 +759,52 @@ def play_video(
 
 
 def _apply_sticky() -> None:
-    """Daemon thread: wait for the ytv mpv window and make it sticky (all workspaces)."""
+    """
+    Daemon thread: query mpv's window ID via IPC, then make it sticky
+    (visible on all workspaces).  Uses the window ID directly to avoid
+    accidentally targeting the terminal window which also carries the
+    title 'ytv'.
+    """
+    # Wait for mpv to create the IPC socket and open its window
+    win_id = None
+    for _ in range(50):   # up to 5 s
+        time.sleep(0.1)
+        if not Path(_SOCK_PATH).exists():
+            continue
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect(_SOCK_PATH)
+            s.sendall(b'{"command":["get_property","window-id"]}\n')
+            data = b""
+            while b"\n" not in data:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            s.close()
+            msg = json.loads(data.decode().strip().splitlines()[0])
+            wid = msg.get("data")
+            if isinstance(wid, int) and wid > 0:
+                win_id = wid
+                break
+        except Exception:
+            pass
+
+    if win_id is None:
+        return
+
+    hex_id = hex(win_id)
     for cmd in (
-        ["wmctrl", "-r", "ytv", "-b", "add,sticky"],
-        ["xdotool", "search", "--name", "ytv", "windowstate", "--add", "STICKY"],
+        ["wmctrl", "-i", "-r", hex_id, "-b", "add,sticky"],
+        ["xdotool", "windowstate", "--add", "STICKY", str(win_id)],
     ):
-        for _ in range(50):   # poll up to 5 s for the window to appear
-            time.sleep(0.1)
-            try:
-                r = subprocess.run(cmd, capture_output=True)
-                if r.returncode == 0:
-                    return
-            except FileNotFoundError:
-                break   # tool not available — try next
+        try:
+            r = subprocess.run(cmd, capture_output=True)
+            if r.returncode == 0:
+                return
+        except FileNotFoundError:
+            continue
 
 
 def copy_to_clipboard(text: str) -> bool:
