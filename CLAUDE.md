@@ -1,18 +1,40 @@
 # ytv - Claude Project Notes
 
 ## What this project is
-A terminal YouTube viewer (`ytv`) that reads subscriptions from FreeTube's local
-database and lets you browse/play recent videos using fzf + mpv. No YouTube
-account, no API key, no ads.
+A terminal YouTube viewer (`ytv`). Browse/play YouTube videos from subscriptions
+using fzf + mpv. No account, no API key, no ads.
 
 ## Architecture
 - **Single script**: `ytv` (Python 3, stdlib only — no pip dependencies)
 - **Feeds**: YouTube Atom RSS feeds (`/feeds/videos.xml?channel_id=...`) — free,
   no auth, returns 15 most recent videos per channel
-- **Subscriptions**: Read directly from FreeTube's `profiles.db` (NDJSON format)
+- **Subscriptions**: `~/.config/ytv/subscriptions.json` (list of {id, name})
+  - Auto-migrates from `~/.config/FreeTube/profiles.db` on first run if present
+- **Search / recommendations**: yt-dlp `ytsearch` and flat-playlist
 - **Cache**: `~/.cache/ytv/feeds/<channel_id>.xml`, TTL-based (default 1 hour)
 - **Player**: mpv with `--geometry=50%x50%-0+0` (top-right quarter of screen)
-- **Selector**: fzf with hidden URL field, multi-select, CTRL-R refresh
+- **Selector**: fzf, 6-field tab-separated (url+channel_id hidden, display shown)
+
+## fzf line format
+`url\tchannel_id\tdate\tchannel\tviews\tdisplay_string`
+- `--with-nth=6` shows only display_string
+- `{1}`=url `{2}`=channel_id `{3}`=date `{4}`=channel `{5}`=views in preview
+
+## Key commands (v2.0)
+- `ytv` / `ytv browse` — main feed
+- `ytv add [channel]` — subscribe (URL, @handle, or search term)
+- `ytv remove` — unsubscribe via fzf
+- `ytv import <file>` — import OPML/JSON/NDJSON/text
+- `ytv search [query]` — search YouTube
+- `ytv subs` / `ytv config` / `ytv init-config`
+
+## fzf keybindings
+- ENTER/CTRL-A: play / audio-only — **ytv stays open after play**
+- CTRL-S: search YouTube (opens search panel)
+- CTRL-N: more from channel (opens channel panel via yt-dlp)
+- CTRL-R: refresh feeds
+- CTRL-B: subscribe to channel (in search/channel panels)
+- CTRL-Y: copy URL
 
 ## Key files
 | File | Purpose |
@@ -25,15 +47,14 @@ account, no API key, no ads.
 ## User's environment (winifred)
 - OS: Manjaro Linux (Arch-based), hostname `winifred`
 - Shell: zsh
-- Installed: fzf (`/usr/bin/fzf`), yt-dlp (`/usr/bin/yt-dlp`)
-- NOT installed: mpv (install.sh handles this)
-- FreeTube DB: `~/.config/FreeTube/profiles.db` (134 subscriptions, NDJSON)
+- Installed: fzf, yt-dlp, mpv (all at /usr/bin/)
+- Subscriptions: `~/.config/ytv/subscriptions.json` (134 channels, auto-migrated)
 - VLC used for local video — mpv is only for ytv
 
 ## Config
 - Config file: `~/.config/ytv/config.json` (optional, defaults in script)
-- Run `ytv --init-config` to generate it
-- Key settings: `mpv_geometry`, `cache_ttl`, `quality`, `freetube_db`
+- Run `ytv init-config` to generate it
+- Key settings: `mpv_geometry`, `cache_ttl`, `quality`
 
 ## Update process
 ```bash
@@ -43,15 +64,16 @@ git pull
 ```
 
 ## Common tasks for Claude
-- **Adding features**: The script is self-contained in `ytv`. Keep it stdlib-only.
+- **Adding features**: Self-contained in `ytv`. Keep it stdlib-only.
 - **Changing mpv geometry**: Edit `DEFAULT_CONFIG["mpv_geometry"]` or `config.json`
 - **Changing fzf layout**: Edit `run_fzf()` function
-- **Debugging feed parsing**: Use `ytv --list-subs` and `ytv --verbose`
-- **Testing without mpv**: Set player to `echo` in config for dry-run
+- **Debugging feeds**: `ytv subs` to list, `ytv -v` for verbose fetch
+- **Import formats**: OPML, NDJSON, JSON array, plain text (auto-detected)
 
 ## Design constraints
 - No external Python packages (stdlib only for portability)
-- yt-dlp is available but NOT used for feed fetching (RSS is faster)
-- yt-dlp IS used internally by mpv's ytdl hook for actual playback
+- RSS feeds for subscribed channels (fast, cached); yt-dlp for search/deep-dive
+- yt-dlp IS used by mpv's ytdl hook for actual streaming
 - Must not interfere with VLC (system default for local video)
 - GitHub repo: https://github.com/tlarcombe/ytv
+- README must not mention FreeTube by name (CLAUDE.md/comments can)

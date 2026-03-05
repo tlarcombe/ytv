@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-ytv - Terminal YouTube viewer via FreeTube subscriptions.
+ytv - Terminal YouTube viewer.
 
-Fetches latest videos from your subscribed channels using YouTube's RSS feeds
-and plays them with mpv in the top-right quarter of your screen.
-
-Usage: ytv [--refresh] [--audio] [--verbose]
+Browse and play YouTube videos from your subscriptions with fzf and mpv.
+No account, no API key, no ads.
 """
 
 import argparse
@@ -14,38 +12,31 @@ import os
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ─── Version ──────────────────────────────────────────────────────────────────
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
-# ─── Paths ────────────────────────────────────────────────────────────────────
-CONFIG_DIR  = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ytv"
-CACHE_DIR   = Path(os.environ.get("XDG_CACHE_HOME",  Path.home() / ".cache"))  / "ytv"
-FEED_CACHE  = CACHE_DIR / "feeds"
-
-DEFAULT_FREETUBE_DB = (
-    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    / "FreeTube" / "profiles.db"
-)
+# ─── Paths ───────────────────────────────────────────────────────────────────
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ytv"
+CACHE_DIR  = Path(os.environ.get("XDG_CACHE_HOME",  Path.home() / ".cache"))  / "ytv"
+FEED_CACHE = CACHE_DIR / "feeds"
+SUBS_FILE  = CONFIG_DIR / "subscriptions.json"
 
 DEFAULT_CONFIG: dict = {
-    "freetube_db":        str(DEFAULT_FREETUBE_DB),
-    "cache_ttl":          3600,           # seconds before feed refresh (1 hour)
-    "max_videos":         500,            # max total videos shown in fzf
-    "fetch_workers":      20,             # parallel feed fetch threads
-    "mpv_geometry":       "50%x50%-0+0",  # top-right quarter of screen
-    "mpv_extra_args":     [],             # extra flags passed to mpv
-    "quality":            "bestvideo[height<=720]+bestaudio/best[height<=720]",
-    "audio_quality":      "bestaudio/best",
+    "cache_ttl":      3600,
+    "max_videos":     500,
+    "fetch_workers":  20,
+    "mpv_geometry":   "50%x50%-0+0",
+    "mpv_extra_args": [],
+    "quality":        "bestvideo[height<=720]+bestaudio/best[height<=720]",
+    "audio_quality":  "bestaudio/best",
 }
 
-# ─── Config ───────────────────────────────────────────────────────────────────
+# ─── Config ──────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
     config = dict(DEFAULT_CONFIG)
@@ -55,104 +46,203 @@ def load_config() -> dict:
             with open(config_file) as f:
                 config.update(json.load(f))
         except (json.JSONDecodeError, OSError) as e:
-            warn(f"Could not read config file: {e}")
+            warn(f"Config error: {e}")
     return config
 
 
 def save_default_config() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     config_file = CONFIG_DIR / "config.json"
-    if not config_file.exists():
-        with open(config_file, "w") as f:
-            json.dump(DEFAULT_CONFIG, f, indent=2)
-        info(f"Default config written to {config_file}")
+    if config_file.exists():
+        warn(f"Config already exists: {config_file}")
+        return
+    with open(config_file, "w") as f:
+        json.dump(DEFAULT_CONFIG, f, indent=2)
+    info(f"Config written to {config_file}")
 
-# ─── Subscriptions ────────────────────────────────────────────────────────────
+# ─── Subscriptions ───────────────────────────────────────────────────────────
 
-def load_subscriptions(db_path: Path) -> list[dict]:
-    """Parse FreeTube's profiles.db (NDJSON) and return unique subscriptions."""
-    if not db_path.exists():
-        die(
-            f"FreeTube database not found: {db_path}\n"
-            f"  Is FreeTube installed? Run 'ytv --config' to check the configured path."
-        )
+def _load_subs_file() -> list[dict]:
+    if SUBS_FILE.exists():
+        try:
+            data = json.loads(SUBS_FILE.read_text())
+            if isinstance(data, list):
+                return data
+        except (json.JSONDecodeError, OSError):
+            pass
+    return []
 
-    try:
-        content = db_path.read_text().strip()
-    except OSError as e:
-        die(f"Could not read FreeTube database: {e}")
 
-    subs: list[dict] = []
-    for line in content.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+def save_subs(subs: list[dict]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    SUBS_FILE.write_text(json.dumps(subs, indent=2))
+
+
+def add_sub(subs: list[dict], channel_id: str, name: str) -> bool:
+    """Add subscription if not already present. Returns True if added."""
+    if any(s["id"] == channel_id for s in subs):
+        return False
+    subs.append({"id": channel_id, "name": name})
+    return True
+
+
+def _dedup(subs: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    result = []
+    for s in subs:
+        cid = s.get("id", "")
+        if cid and cid not in seen:
+            seen.add(cid)
+            result.append(s)
+    return result
+
+# ─── Import helpers ──────────────────────────────────────────────────────────
+# These parsers handle several subscription export formats.
+# First-run auto-migration silently checks known locations for existing data.
+
+def _import_ndjson(content: str) -> list[dict]:
+    """NDJSON subscription store — one JSON object per line."""
+    subs = []
+    for line in content.strip().splitlines():
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
         if isinstance(obj.get("subscriptions"), list):
-            subs.extend(obj["subscriptions"])
+            for s in obj["subscriptions"]:
+                cid = s.get("id", "")
+                if cid:
+                    subs.append({"id": cid, "name": s.get("name", cid)})
+    return _dedup(subs)
 
-    # Deduplicate by channel ID (preserve first occurrence)
-    seen: set[str] = set()
-    unique: list[dict] = []
-    for sub in subs:
-        cid = sub.get("id", "")
-        if cid and cid not in seen:
-            seen.add(cid)
-            unique.append(sub)
 
-    return unique
+def _import_opml(content: str) -> list[dict]:
+    """YouTube OPML subscription export."""
+    subs = []
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return []
+    for outline in root.iter("outline"):
+        xml_url = outline.get("xmlUrl", "")
+        name    = outline.get("title") or outline.get("text", "")
+        if "channel_id=" in xml_url and name:
+            cid = xml_url.split("channel_id=")[-1].split("&")[0]
+            if cid:
+                subs.append({"id": cid, "name": name})
+    return _dedup(subs)
 
-# ─── Feed Fetching ────────────────────────────────────────────────────────────
 
-FEED_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
+def import_from_file(path: Path) -> list[dict]:
+    """Auto-detect format and return subscriptions from file."""
+    try:
+        content = path.read_text(errors="replace").strip()
+    except OSError as e:
+        die(f"Cannot read {path}: {e}")
+    if not content:
+        return []
+    if content.startswith("<"):
+        return _import_opml(content)
+    if content.startswith("{"):
+        return _import_ndjson(content)
+    try:
+        data = json.loads(content)
+        if isinstance(data, list):
+            result = []
+            for item in data:
+                if isinstance(item, dict) and item.get("id"):
+                    result.append({"id": item["id"], "name": item.get("name", item["id"])})
+                elif isinstance(item, str) and item.strip():
+                    result.append({"id": item.strip(), "name": item.strip()})
+            return _dedup(result)
+    except json.JSONDecodeError:
+        pass
+    # Plain text: one channel URL / ID per line
+    subs = []
+    for line in content.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            subs.append({"id": line, "name": line})
+    return _dedup(subs)
+
+
+# Known locations to check for existing subscription data on first run.
+_MIGRATION_CANDIDATES = [
+    Path.home() / ".config" / "FreeTube" / "profiles.db",
+]
+
+
+def load_subs() -> list[dict]:
+    """Load subscriptions; auto-migrate from known sources on first run."""
+    subs = _load_subs_file()
+    if subs:
+        return subs
+    for path in _MIGRATION_CANDIDATES:
+        if path.exists():
+            try:
+                imported = import_from_file(path)
+                if imported:
+                    save_subs(imported)
+                    info(f"Imported {len(imported)} subscriptions → {SUBS_FILE}")
+                    return imported
+            except Exception:
+                pass
+    return []
+
+# ─── Channel resolution (yt-dlp) ─────────────────────────────────────────────
+
+def resolve_channel(url: str) -> dict | None:
+    """Resolve a YouTube URL to {id, name} using yt-dlp."""
+    cmd = [
+        "yt-dlp", "--playlist-items=0",
+        "--print=%(channel_id)s", "--print=%(channel)s",
+        "--quiet", "--no-warnings", url,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        lines = [l for l in r.stdout.strip().splitlines() if l and l != "NA"]
+        if len(lines) >= 2:
+            return {"id": lines[0], "name": lines[1]}
+    except Exception:
+        pass
+    return None
+
+# ─── Feed fetching (RSS) ─────────────────────────────────────────────────────
+
+_FEED_URL  = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+_UA        = "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
 
 
 def fetch_channel_feed(
-    channel_id: str,
-    channel_name: str,
-    cache_ttl: int,
-    force: bool = False,
+    channel_id: str, name: str, cache_ttl: int, force: bool = False
 ) -> tuple[str, str] | None:
-    """
-    Fetch RSS Atom feed for a channel.
-    Returns (channel_name, xml_content) or None on unrecoverable failure.
-    Uses a file cache with TTL; returns stale cache on network error.
-    """
-    cache_path = FEED_CACHE / f"{channel_id}.xml"
-
-    if not force and cache_path.exists():
-        age = time.time() - cache_path.stat().st_mtime
-        if age < cache_ttl:
+    """Fetch RSS feed. Returns (name, xml) or None. Falls back to stale cache."""
+    cache = FEED_CACHE / f"{channel_id}.xml"
+    if not force and cache.exists():
+        if time.time() - cache.stat().st_mtime < cache_ttl:
             try:
-                return channel_name, cache_path.read_text()
+                return name, cache.read_text()
             except OSError:
-                pass  # fall through to fetch
-
-    url = FEED_URL.format(channel_id=channel_id)
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+                pass
     try:
+        req = urllib.request.Request(
+            _FEED_URL.format(channel_id=channel_id), headers={"User-Agent": _UA}
+        )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            xml_content = resp.read().decode("utf-8", errors="replace")
-        # Atomic write to cache
+            xml = resp.read().decode("utf-8", errors="replace")
         FEED_CACHE.mkdir(parents=True, exist_ok=True)
-        tmp = cache_path.with_suffix(".tmp")
-        tmp.write_text(xml_content)
-        tmp.rename(cache_path)
-        return channel_name, xml_content
+        tmp = cache.with_suffix(".tmp")
+        tmp.write_text(xml)
+        tmp.rename(cache)
+        return name, xml
     except Exception:
-        # Network/HTTP error: return stale cache if available
-        if cache_path.exists():
+        if cache.exists():
             try:
-                return channel_name, cache_path.read_text()
+                return name, cache.read_text()
             except OSError:
                 pass
         return None
 
-# ─── Feed Parsing ─────────────────────────────────────────────────────────────
 
 _NS = {
     "atom":  "http://www.w3.org/2005/Atom",
@@ -161,42 +251,42 @@ _NS = {
 }
 
 
-def _fmt_views(views_str: str) -> str:
+def _fmt_views(v: str) -> str:
     try:
-        v = int(views_str)
+        n = int(v)
     except (ValueError, TypeError):
         return ""
-    if v >= 1_000_000:
-        return f"{v/1_000_000:.1f}M"
-    if v >= 1_000:
-        return f"{v/1_000:.0f}K"
-    return str(v)
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.0f}K"
+    return str(n)
 
 
-def parse_feed(xml_content: str, channel_name: str) -> list[dict]:
-    """Parse a YouTube Atom feed. Returns a list of video metadata dicts."""
+def parse_feed(xml: str, channel_name: str) -> list[dict]:
+    """Parse YouTube Atom feed. Returns list of video dicts."""
     try:
-        root = ET.fromstring(xml_content)
+        root = ET.fromstring(xml)
     except ET.ParseError:
         return []
+    feed_cid_el = root.find("yt:channelId", _NS)
+    feed_cid = (feed_cid_el.text or "").strip() if feed_cid_el is not None else ""
 
-    videos: list[dict] = []
+    videos = []
     for entry in root.findall("atom:entry", _NS):
         try:
-            vid_el   = entry.find("yt:videoId", _NS)
-            title_el = entry.find("atom:title", _NS)
-            pub_el   = entry.find("atom:published", _NS)
-
-            if vid_el is None or title_el is None:
+            vid_el = entry.find("yt:videoId", _NS)
+            ttl_el = entry.find("atom:title", _NS)
+            pub_el = entry.find("atom:published", _NS)
+            cid_el = entry.find("yt:channelId", _NS)
+            if vid_el is None or ttl_el is None:
                 continue
+            video_id   = (vid_el.text or "").strip()
+            title      = (ttl_el.text or "Untitled").strip()
+            channel_id = (cid_el.text or feed_cid).strip() if cid_el is not None else feed_cid
 
-            video_id = (vid_el.text or "").strip()
-            title    = (title_el.text or "Untitled").strip()
-            url      = f"https://www.youtube.com/watch?v={video_id}"
-
-            # Parse ISO-8601 date
-            pub_ts   = 0.0
-            pub_date = "????-??-??"
+            pub_ts = 0.0
+            pub_date = ""
             if pub_el is not None and pub_el.text:
                 try:
                     dt = datetime.fromisoformat(pub_el.text.replace("Z", "+00:00"))
@@ -205,165 +295,229 @@ def parse_feed(xml_content: str, channel_name: str) -> list[dict]:
                 except ValueError:
                     pass
 
-            # Views from media:community/media:statistics
             views = ""
             mg = entry.find("media:group", _NS)
             if mg is not None:
-                stats = mg.find("media:community/media:statistics", _NS)
-                if stats is not None:
-                    views = _fmt_views(stats.get("views", ""))
+                st = mg.find("media:community/media:statistics", _NS)
+                if st is not None:
+                    views = _fmt_views(st.get("views", ""))
 
             videos.append({
-                "url":     url,
-                "id":      video_id,
-                "title":   title,
-                "channel": channel_name,
-                "date":    pub_date,
-                "ts":      pub_ts,
-                "views":   views,
+                "url":        f"https://www.youtube.com/watch?v={video_id}",
+                "id":         video_id,
+                "title":      title,
+                "channel":    channel_name,
+                "channel_id": channel_id,
+                "date":       pub_date,
+                "ts":         pub_ts,
+                "views":      views,
             })
         except Exception:
             continue
-
     return videos
 
-# ─── Aggregation ─────────────────────────────────────────────────────────────
 
 def get_all_videos(
-    subs: list[dict],
-    config: dict,
-    force: bool = False,
-    verbose: bool = False,
+    subs: list[dict], config: dict, force: bool = False, verbose: bool = False
 ) -> list[dict]:
-    """Fetch and aggregate videos from all subscriptions in parallel."""
+    """Fetch and aggregate feeds from all subscriptions in parallel."""
     total = len(subs)
-    if verbose:
-        eprint(f"Fetching feeds for {total} channels...")
-
     all_videos: list[dict] = []
     done = 0
 
     with ThreadPoolExecutor(max_workers=config["fetch_workers"]) as pool:
         futures = {
-            pool.submit(
-                fetch_channel_feed,
-                sub["id"],
-                sub["name"],
-                config["cache_ttl"],
-                force,
-            ): sub
-            for sub in subs
+            pool.submit(fetch_channel_feed, s["id"], s["name"], config["cache_ttl"], force): s
+            for s in subs
         }
-
         for future in as_completed(futures):
             done += 1
             if verbose:
                 eprint(f"\r  {done}/{total} channels fetched...", end="")
-            result = future.result()
-            if result:
-                channel_name, xml_content = result
-                all_videos.extend(parse_feed(xml_content, channel_name))
+            r = future.result()
+            if r:
+                all_videos.extend(parse_feed(r[1], r[0]))
 
     if verbose:
-        eprint()  # newline after progress
-
-    # Sort by published date, newest first
+        eprint()
     all_videos.sort(key=lambda v: v["ts"], reverse=True)
-    return all_videos[:config["max_videos"]]
+    return all_videos[: config["max_videos"]]
 
-# ─── fzf Interface ────────────────────────────────────────────────────────────
+# ─── yt-dlp helpers (search / channel deep-dive) ─────────────────────────────
 
-# Tab-separated fields: URL | date | channel | views | title
-# fzf hides field 1 (URL) using --with-nth=2..
-_FIELD_SEP = "\t"
+def search_youtube(query: str, config: dict, limit: int = 25) -> list[dict]:
+    """Search YouTube via yt-dlp. Returns video list."""
+    cmd = [
+        "yt-dlp", "--flat-playlist", f"--playlist-end={limit}",
+        "--print=%(title)s\t%(id)s\t%(channel_id)s\t%(channel)s\t%(view_count)s",
+        "--quiet", "--no-warnings",
+        f"ytsearch{limit}:{query}",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    videos = []
+    for line in r.stdout.strip().splitlines():
+        parts = line.split("\t")
+        if len(parts) < 5:
+            continue
+        title, vid_id, cid, channel, views = (p if p != "NA" else "" for p in parts[:5])
+        if not vid_id:
+            continue
+        videos.append({
+            "url":        f"https://www.youtube.com/watch?v={vid_id}",
+            "id":         vid_id,
+            "title":      title,
+            "channel":    channel,
+            "channel_id": cid,
+            "date":       "",
+            "ts":         0.0,
+            "views":      _fmt_views(views) if views else "",
+        })
+    return videos
 
 
-def format_video_line(v: dict) -> str:
-    channel = v["channel"][:26].ljust(26)
-    views   = v["views"].rjust(6) if v["views"] else " " * 6
-    title   = v["title"].replace("\t", " ")
-    return f"{v['url']}{_FIELD_SEP}{v['date']}  {channel}  {views}  {title}"
+def fetch_channel_yt_dlp(channel_id: str, name: str, limit: int = 30) -> list[dict]:
+    """Fetch recent videos from a channel via yt-dlp flat-playlist."""
+    cmd = [
+        "yt-dlp", "--flat-playlist", "--lazy-playlist",
+        f"--playlist-end={limit}",
+        "--extractor-args=youtubetab:approximate_date",
+        "--print=%(title)s\t%(id)s\t%(timestamp)s\t%(channel)s\t%(view_count)s",
+        "--quiet", "--no-warnings",
+        f"https://www.youtube.com/channel/{channel_id}/videos",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    videos = []
+    for line in r.stdout.strip().splitlines():
+        parts = line.split("\t")
+        if len(parts) < 5:
+            continue
+        title, vid_id, ts_str, channel, views = (p if p != "NA" else "" for p in parts[:5])
+        if not vid_id:
+            continue
+        pub_ts = 0.0
+        pub_date = ""
+        try:
+            pub_ts   = float(ts_str)
+            pub_date = datetime.fromtimestamp(pub_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        except (ValueError, OSError, OverflowError):
+            pass
+        videos.append({
+            "url":        f"https://www.youtube.com/watch?v={vid_id}",
+            "id":         vid_id,
+            "title":      title,
+            "channel":    channel or name,
+            "channel_id": channel_id,
+            "date":       pub_date,
+            "ts":         pub_ts,
+            "views":      _fmt_views(views) if views else "",
+        })
+    return videos
 
+# ─── fzf interface ───────────────────────────────────────────────────────────
+# Line format (6 tab-separated fields):
+#   1: url        ← hidden
+#   2: channel_id ← hidden
+#   3: date       ← hidden (available in preview via {3})
+#   4: channel    ← hidden (available in preview via {4})
+#   5: views      ← hidden (available in preview via {5})
+#   6: display    ← shown (--with-nth=6)
 
-HEADER = (
-    "ENTER: play  │  ctrl-a: audio only  │  ctrl-y: copy URL  │  "
-    "ctrl-r: refresh  │  TAB: multi-select"
+_PREVIEW = "printf 'Channel:  {4}\\nDate:     {3}\\nViews:    {5}\\nURL:      {1}'"
+
+_MAIN_HDR   = (
+    "ENTER:play  CTRL-A:audio  CTRL-Y:copy URL  "
+    "CTRL-S:search  CTRL-N:more from channel  CTRL-R:refresh  TAB:multi-select"
+)
+_EXTRA_HDR  = (
+    "ENTER:play  CTRL-A:audio  CTRL-Y:copy URL  "
+    "CTRL-B:subscribe to channel  TAB:multi-select  ESC:back"
 )
 
 
-def run_fzf(videos: list[dict], config: dict) -> tuple[str, list[str]] | None:
+def _fmt_line(v: dict) -> str:
+    date    = v.get("date", "")
+    channel = v.get("channel", "")[:26].ljust(26)
+    views   = v.get("views", "").rjust(6) if v.get("views") else " " * 6
+    title   = v.get("title", "").replace("\t", " ")
+    display = f"{date}  {channel}  {views}  {title}"
+    return "\t".join([
+        v.get("url", ""),
+        v.get("channel_id", ""),
+        v.get("date", ""),
+        v.get("channel", ""),
+        v.get("views", ""),
+        display,
+    ])
+
+
+def run_fzf(
+    videos: list[dict],
+    prompt: str = "ytv> ",
+    header: str = "",
+    extra_keys: list[str] | None = None,
+) -> tuple[str, list[str]] | None:
     """
-    Show videos in fzf. Returns (action_key, [url, ...]) or None if cancelled.
+    Show video list in fzf.
+    Returns (key_pressed, [raw_tab_separated_lines]) or None if cancelled.
     """
     if not videos:
-        die("No videos found. Run with --refresh to update feeds.")
-
-    lines = "\n".join(format_video_line(v) for v in videos)
-
-    cmd = [
+        return None
+    lines = "\n".join(_fmt_line(v) for v in videos)
+    keys  = ["enter", "ctrl-a", "ctrl-y", "ctrl-r"] + (extra_keys or [])
+    cmd   = [
         "fzf",
         "--multi",
-        f"--delimiter={_FIELD_SEP}",
-        "--with-nth=2..",
+        "--delimiter=\t",
+        "--with-nth=6",
         "--layout=reverse",
         "--info=inline",
-        f"--header={HEADER}",
-        "--prompt=ytv> ",
-        "--expect=enter,ctrl-a,ctrl-y,ctrl-r",
-        "--preview=printf 'URL:     {1}\\nChannel: {3}\\nViews:   {4}\\nDate:    {2}'",
+        f"--header={header}",
+        f"--prompt={prompt}",
+        f"--expect={','.join(keys)}",
+        f"--preview={_PREVIEW}",
         "--preview-window=up:4:wrap",
-        "--bind=ctrl-r:abort",  # handled below by key detection
     ]
-
     try:
-        result = subprocess.run(
-            cmd,
-            input=lines,
-            capture_output=True,
-            text=True,
-        )
+        r = subprocess.run(cmd, input=lines, capture_output=True, text=True)
     except FileNotFoundError:
-        die("fzf not found. Install it: sudo pacman -S fzf")
-
-    # fzf exits with 1 if nothing selected, 130 if escaped
-    if result.returncode not in (0, 1):
+        die("fzf not found. Install: sudo pacman -S fzf")
+    if r.returncode not in (0, 1):
         return None
-
-    output = result.stdout.strip()
+    output = r.stdout.strip()
     if not output:
         return None
-
     output_lines = output.splitlines()
-    key = output_lines[0] if output_lines else "enter"
+    key      = output_lines[0] if output_lines else "enter"
     selected = output_lines[1:] if len(output_lines) > 1 else []
+    return key, selected
 
-    if not selected and key not in ("ctrl-r", "ctrl-y"):
-        return None
 
-    urls = [line.split(_FIELD_SEP)[0] for line in selected if line]
-    return key, urls
+def _urls(lines: list[str]) -> list[str]:
+    return [l.split("\t")[0] for l in lines if l]
 
-# ─── Player ───────────────────────────────────────────────────────────────────
+
+def _channel_of(lines: list[str]) -> tuple[str, str]:
+    """Return (channel_id, channel_name) from the first line."""
+    if not lines:
+        return "", ""
+    parts = lines[0].split("\t")
+    return (parts[1] if len(parts) > 1 else ""), (parts[3] if len(parts) > 3 else "")
+
+# ─── Player ──────────────────────────────────────────────────────────────────
 
 def play_video(urls: list[str], audio_only: bool, config: dict) -> None:
-    """Launch mpv with the selected URL(s) in top-right quarter of the screen."""
     cmd = ["mpv"]
-
-    if not audio_only:
-        cmd += [f"--geometry={config['mpv_geometry']}"]
-        cmd += [f"--ytdl-format={config['quality']}"]
+    if audio_only:
+        cmd += ["--no-video", f"--ytdl-format={config['audio_quality']}"]
     else:
-        cmd += ["--no-video"]
-        cmd += [f"--ytdl-format={config['audio_quality']}"]
-
-    cmd += ["--title=ytv"]
-
-    extra = config.get("mpv_extra_args", [])
-    if isinstance(extra, list):
-        cmd += extra
-
-    cmd += ["--"] + urls
-
+        cmd += [f"--geometry={config['mpv_geometry']}", f"--ytdl-format={config['quality']}"]
+    cmd += ["--title=ytv"] + (config.get("mpv_extra_args") or []) + ["--"] + urls
     try:
         subprocess.Popen(
             cmd,
@@ -372,11 +526,10 @@ def play_video(urls: list[str], audio_only: bool, config: dict) -> None:
             stderr=subprocess.DEVNULL,
         )
     except FileNotFoundError:
-        die("mpv not found. Install it: sudo pacman -S mpv")
+        die("mpv not found. Install: sudo pacman -S mpv")
 
 
 def copy_to_clipboard(text: str) -> bool:
-    """Copy text to clipboard. Returns True on success."""
     for cmd in (
         ["wl-copy"],
         ["xclip", "-selection", "clipboard"],
@@ -392,131 +545,380 @@ def copy_to_clipboard(text: str) -> bool:
             continue
     return False
 
-# ─── Utility ─────────────────────────────────────────────────────────────────
+# ─── Utilities ───────────────────────────────────────────────────────────────
 
-def eprint(*args, end="\n", **kwargs):
-    print(*args, end=end, file=sys.stderr, **kwargs)
+def eprint(*args, end="\n"):
+    print(*args, end=end, file=sys.stderr)
 
-def info(msg: str):
-    eprint(f"\033[32m✓\033[0m {msg}")
+def info(msg: str):  eprint(f"\033[32m✓\033[0m {msg}")
+def warn(msg: str):  eprint(f"\033[33m!\033[0m {msg}")
+def die(msg: str):   eprint(f"\033[31merror:\033[0m {msg}"); sys.exit(1)
 
-def warn(msg: str):
-    eprint(f"\033[33m!\033[0m {msg}")
+# ─── Auxiliary fzf panel (search results / more-from-channel) ────────────────
 
-def die(msg: str):
-    eprint(f"\033[31merror:\033[0m {msg}")
-    sys.exit(1)
-
-# ─── CLI ─────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="ytv",
-        description="Terminal YouTube viewer using FreeTube subscriptions",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-fzf keybindings:
-  ENTER       Play selected video(s) with mpv
-  CTRL-A      Play audio only (no video)
-  CTRL-Y      Copy URL(s) to clipboard
-  CTRL-R      Force-refresh all feeds and reopen
-  TAB         Toggle multi-select
-
-Examples:
-  ytv                  Browse and play videos
-  ytv --refresh        Force-refresh all channel feeds
-  ytv --audio          Override to audio-only playback
-  ytv --list-subs      Print all subscribed channels
-  ytv --config         Show configuration paths and settings
-  ytv --init-config    Write a default config.json you can edit
-""",
-    )
-    parser.add_argument("--refresh",     "-r", action="store_true", help="Force refresh all feeds (ignore cache)")
-    parser.add_argument("--audio",       "-a", action="store_true", help="Audio-only mode")
-    parser.add_argument("--verbose",     "-v", action="store_true", help="Verbose output")
-    parser.add_argument("--config",            action="store_true", help="Show config info and exit")
-    parser.add_argument("--init-config",       action="store_true", help="Write default config.json and exit")
-    parser.add_argument("--list-subs",         action="store_true", help="List subscribed channels and exit")
-    parser.add_argument("--version",           action="version", version=f"ytv {VERSION}")
-    args = parser.parse_args()
-
-    config = load_config()
-
-    # ── --config ──────────────────────────────────────────────────────────────
-    if args.config:
-        print(f"Config dir:    {CONFIG_DIR}")
-        print(f"Cache dir:     {CACHE_DIR}")
-        print(f"FreeTube DB:   {config['freetube_db']}")
-        print(f"Cache TTL:     {config['cache_ttl']}s ({config['cache_ttl']//60} min)")
-        print(f"Max videos:    {config['max_videos']}")
-        print(f"mpv geometry:  {config['mpv_geometry']}")
-        print(f"Quality:       {config['quality']}")
-        config_file = CONFIG_DIR / "config.json"
-        if config_file.exists():
-            print(f"\nConfig file: {config_file}")
-        else:
-            print(f"\nNo config file (using defaults). Run: ytv --init-config")
-        return
-
-    # ── --init-config ─────────────────────────────────────────────────────────
-    if args.init_config:
-        save_default_config()
-        return
-
-    # Ensure directories exist
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    FEED_CACHE.mkdir(parents=True, exist_ok=True)
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-
-    # ── --list-subs ───────────────────────────────────────────────────────────
-    subs = load_subscriptions(Path(config["freetube_db"]))
-
-    if args.list_subs:
-        for sub in sorted(subs, key=lambda s: s["name"].lower()):
-            print(f"{sub['id']}  {sub['name']}")
-        eprint(f"\nTotal: {len(subs)} subscriptions")
-        return
-
-    # ── Main flow ─────────────────────────────────────────────────────────────
-    eprint(f"ytv {VERSION}  │  {len(subs)} subscriptions  │  fetching feeds...")
-
-    force = args.refresh
+def show_panel(videos: list[dict], subs: list[dict], config: dict, title: str) -> None:
+    """
+    Show a secondary video panel (search results, channel deep-dive, etc.).
+    Supports CTRL-B to subscribe to a channel and CTRL-A for audio.
+    Returns after user exits or takes an action.
+    """
     while True:
-        videos = get_all_videos(subs, config, force=force, verbose=args.verbose)
-
-        if not videos:
-            die("No videos found. Check your FreeTube subscriptions or run: ytv --refresh")
-
-        eprint(f"\033[A\033[2K", end="")  # clear the "fetching" line
-
-        result = run_fzf(videos, config)
+        result = run_fzf(
+            videos,
+            prompt=f"{title}> ",
+            header=_EXTRA_HDR,
+            extra_keys=["ctrl-b"],
+        )
         if result is None:
             break
 
-        key, urls = result
+        key, lines = result
+        urls = _urls(lines)
 
-        if key == "ctrl-r":
-            # Refresh feeds and reopen fzf
-            eprint("Refreshing feeds...")
-            force = True
-            continue
+        if key == "ctrl-b":
+            cid, cname = _channel_of(lines)
+            if cid:
+                if add_sub(subs, cid, cname):
+                    save_subs(subs)
+                    info(f"Subscribed to {cname}")
+                else:
+                    warn(f"Already subscribed to {cname}")
+            break
 
         if not urls:
             break
 
         if key == "ctrl-y":
-            text = "\n".join(urls)
-            if copy_to_clipboard(text):
+            if copy_to_clipboard("\n".join(urls)):
                 info(f"Copied {len(urls)} URL(s) to clipboard.")
             else:
-                warn("Could not copy to clipboard. Install wl-clipboard or xclip.")
-                print(text)
-        elif key == "ctrl-a" or args.audio:
-            play_video(urls, audio_only=True, config=config)
-        else:
-            play_video(urls, audio_only=False, config=config)
+                warn("Clipboard unavailable. Install wl-clipboard or xclip.")
+                print("\n".join(urls))
+            continue
 
-        break
+        if key in ("enter", "ctrl-a"):
+            play_video(urls, audio_only=(key == "ctrl-a"), config=config)
+            continue  # stay in panel after playing
+
+# ─── Commands ────────────────────────────────────────────────────────────────
+
+def cmd_browse(args, config: dict, subs: list[dict]) -> None:
+    if not subs:
+        die("No subscriptions. Add channels with:\n  ytv add <channel-url-or-search-term>")
+
+    force   = getattr(args, "refresh", False)
+    verbose = getattr(args, "verbose", False)
+    audio   = getattr(args, "audio",   False)
+
+    eprint(f"ytv {VERSION}  │  {len(subs)} subscriptions  │  fetching feeds...")
+    videos = get_all_videos(subs, config, force=force, verbose=verbose)
+    eprint("\r\033[K", end="")
+
+    while True:
+        if not videos:
+            die("No videos found. Run: ytv -r")
+
+        result = run_fzf(videos, header=_MAIN_HDR, extra_keys=["ctrl-s", "ctrl-n"])
+        if result is None:
+            break
+
+        key, lines = result
+
+        # ── Refresh ───────────────────────────────────────────────────────────
+        if key == "ctrl-r":
+            eprint("Refreshing feeds...")
+            videos = get_all_videos(subs, config, force=True, verbose=verbose)
+            eprint("\r\033[K", end="")
+            continue
+
+        # ── Search ────────────────────────────────────────────────────────────
+        if key == "ctrl-s":
+            try:
+                query = input("Search YouTube: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if not query:
+                continue
+            eprint(f"Searching '{query}'...")
+            results = search_youtube(query, config)
+            eprint("\r\033[K", end="")
+            if not results:
+                warn("No results found.")
+            else:
+                show_panel(results, subs, config, f"Search: {query}")
+            continue
+
+        # ── More from channel ─────────────────────────────────────────────────
+        if key == "ctrl-n":
+            cid, cname = _channel_of(lines)
+            if not cid:
+                warn("No channel information available for this video.")
+                continue
+            eprint(f"Loading videos from {cname}...")
+            more = fetch_channel_yt_dlp(cid, cname)
+            eprint("\r\033[K", end="")
+            if not more:
+                warn(f"Could not load videos from {cname}.")
+            else:
+                show_panel(more, subs, config, f"More: {cname}")
+            continue
+
+        # ── Play / copy ───────────────────────────────────────────────────────
+        urls = _urls(lines)
+        if not urls:
+            continue
+
+        if key == "ctrl-y":
+            if copy_to_clipboard("\n".join(urls)):
+                info(f"Copied {len(urls)} URL(s) to clipboard.")
+            else:
+                warn("Clipboard unavailable. Install wl-clipboard or xclip.")
+                print("\n".join(urls))
+            continue
+
+        if key in ("enter", "ctrl-a") or audio:
+            play_video(urls, audio_only=(key == "ctrl-a" or audio), config=config)
+            continue  # ← stay in ytv after launching mpv
+
+
+def cmd_search(args, config: dict, subs: list[dict]) -> None:
+    query = " ".join(args.query) if args.query else ""
+    if not query:
+        try:
+            query = input("Search YouTube: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+    if not query:
+        return
+    eprint(f"Searching '{query}'...")
+    results = search_youtube(query, config)
+    eprint("\r\033[K", end="")
+    if not results:
+        die("No results found.")
+    show_panel(results, subs, config, f"Search: {query}")
+
+
+def cmd_add(args, config: dict, subs: list[dict]) -> None:
+    target = (getattr(args, "channel", None) or "").strip()
+    if not target:
+        try:
+            target = input("Channel URL, handle (@name), or search term: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+    if not target:
+        return
+
+    is_url = (
+        "youtube.com" in target
+        or "youtu.be" in target
+        or target.startswith("http")
+        or target.startswith("@")
+    )
+
+    if is_url:
+        if not target.startswith("http"):
+            target = f"https://www.youtube.com/{target}"
+        eprint("Resolving channel...")
+        resolved = resolve_channel(target)
+        if not resolved:
+            die(f"Could not resolve channel: {target}")
+        cid, cname = resolved["id"], resolved["name"]
+    else:
+        # Search and let user pick from unique channels in results
+        eprint(f"Searching for '{target}'...")
+        results = search_youtube(target, config, limit=20)
+        eprint("\r\033[K", end="")
+        if not results:
+            die("No results found.")
+        seen: dict[str, str] = {}
+        for v in results:
+            cid_v = v.get("channel_id", "")
+            if cid_v and cid_v not in seen:
+                seen[cid_v] = v.get("channel", cid_v)
+        if not seen:
+            die("Could not extract channel info from search results.")
+        chan_lines = [f"{cid}\t{name}" for cid, name in seen.items()]
+        r = subprocess.run(
+            ["fzf",
+             "--prompt=Subscribe to> ",
+             "--header=Select a channel to subscribe (ENTER to confirm)",
+             "--delimiter=\t",
+             "--with-nth=2"],
+            input="\n".join(chan_lines),
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return
+        parts = r.stdout.strip().split("\t")
+        cid   = parts[0]
+        cname = parts[1] if len(parts) > 1 else parts[0]
+
+    if add_sub(subs, cid, cname):
+        save_subs(subs)
+        info(f"Subscribed to {cname}  ({cid})")
+    else:
+        warn(f"Already subscribed to {cname}")
+
+
+def cmd_remove(subs: list[dict]) -> None:
+    if not subs:
+        die("No subscriptions to remove.")
+    lines = [
+        f"{s['id']}\t{s['name']}"
+        for s in sorted(subs, key=lambda s: s["name"].lower())
+    ]
+    r = subprocess.run(
+        ["fzf",
+         "--multi",
+         "--prompt=Remove> ",
+         "--header=TAB to select channels to unsubscribe, ENTER to confirm",
+         "--delimiter=\t",
+         "--with-nth=2"],
+        input="\n".join(lines),
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return
+    to_remove = {line.split("\t")[0] for line in r.stdout.strip().splitlines()}
+    original  = len(subs)
+    subs[:]   = [s for s in subs if s["id"] not in to_remove]
+    removed   = original - len(subs)
+    if removed:
+        save_subs(subs)
+        info(f"Removed {removed} subscription(s). {len(subs)} remaining.")
+
+
+def cmd_import(args, subs: list[dict]) -> None:
+    path = Path(args.file).expanduser()
+    if not path.exists():
+        die(f"File not found: {path}")
+    imported = import_from_file(path)
+    if not imported:
+        die("No subscriptions found in file.")
+    added = sum(1 for s in imported if add_sub(subs, s["id"], s["name"]))
+    if added:
+        save_subs(subs)
+        info(f"Imported {added} new subscription(s). Total: {len(subs)}")
+    else:
+        info("All channels already subscribed. No changes made.")
+
+
+def cmd_subs(subs: list[dict]) -> None:
+    if not subs:
+        eprint("No subscriptions. Add channels with: ytv add <channel>")
+        return
+    for s in sorted(subs, key=lambda s: s["name"].lower()):
+        print(f"{s['id']}  {s['name']}")
+    eprint(f"\nTotal: {len(subs)} subscriptions")
+
+
+def cmd_show_config(config: dict) -> None:
+    print(f"Config dir:    {CONFIG_DIR}")
+    print(f"Subscriptions: {SUBS_FILE}")
+    print(f"Cache dir:     {CACHE_DIR}")
+    print(f"Cache TTL:     {config['cache_ttl']}s")
+    print(f"Max videos:    {config['max_videos']}")
+    print(f"mpv geometry:  {config['mpv_geometry']}")
+    print(f"Quality:       {config['quality']}")
+    config_file = CONFIG_DIR / "config.json"
+    if config_file.exists():
+        print(f"\nConfig file: {config_file}")
+    else:
+        print(f"\nNo config file (defaults active). Run: ytv init-config")
+
+# ─── Entry point ─────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="ytv",
+        description="Terminal YouTube viewer — browse and play via fzf and mpv",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+fzf keybindings (browse / panel):
+  ENTER       Play selected video(s) with mpv
+  CTRL-A      Audio-only playback
+  CTRL-Y      Copy URL(s) to clipboard
+  CTRL-S      Search YouTube (browse mode)
+  CTRL-N      More videos from this channel (browse mode)
+  CTRL-R      Refresh all feeds (browse mode)
+  CTRL-B      Subscribe to channel (search / channel panel)
+  TAB         Toggle multi-select
+  ESC         Quit
+
+Examples:
+  ytv                      Browse subscription feed
+  ytv -r                   Refresh feeds then browse
+  ytv search linux tips    Search YouTube
+  ytv add @Fireship        Subscribe to a channel by handle
+  ytv add                  Subscribe interactively (search or URL)
+  ytv remove               Unsubscribe via fzf picker
+  ytv subs                 List subscriptions
+  ytv import subs.opml     Import from OPML / JSON / text file
+  ytv config               Show configuration
+  ytv init-config          Write editable config.json
+""",
+    )
+    parser.add_argument("--version", action="version", version=f"ytv {VERSION}")
+
+    # Top-level flags (apply to default browse action)
+    parser.add_argument("--refresh", "-r", action="store_true", help="Force-refresh feeds")
+    parser.add_argument("--audio",   "-a", action="store_true", help="Audio-only playback")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+
+    sub = parser.add_subparsers(dest="cmd")
+
+    sub.add_parser("browse", help="Browse feed (default)")
+
+    sp = sub.add_parser("search", help="Search YouTube")
+    sp.add_argument("query", nargs="*", help="Search terms")
+
+    ap = sub.add_parser("add", help="Subscribe to a channel")
+    ap.add_argument("channel", nargs="?", help="URL, @handle, or search term")
+
+    sub.add_parser("remove",      help="Unsubscribe via fzf picker")
+
+    ip = sub.add_parser("import", help="Import subscriptions from file")
+    ip.add_argument("file", help=".opml / .json / text file")
+
+    sub.add_parser("subs",        help="List subscriptions")
+    sub.add_parser("config",      help="Show configuration paths and settings")
+    sub.add_parser("init-config", help="Write default config.json")
+
+    args   = parser.parse_args()
+    config = load_config()
+
+    for d in (CONFIG_DIR, CACHE_DIR, FEED_CACHE):
+        d.mkdir(parents=True, exist_ok=True)
+
+    cmd = args.cmd
+
+    if cmd == "config":
+        cmd_show_config(config)
+        return
+    if cmd == "init-config":
+        save_default_config()
+        return
+
+    subs = load_subs()
+
+    if cmd == "subs":
+        cmd_subs(subs)
+        return
+    if cmd == "remove":
+        cmd_remove(subs)
+        return
+    if cmd == "import":
+        cmd_import(args, subs)
+        return
+    if cmd == "add":
+        cmd_add(args, config, subs)
+        return
+    if cmd == "search":
+        cmd_search(args, config, subs)
+        return
+
+    # Default: browse
+    cmd_browse(args, config, subs)
 
 
 if __name__ == "__main__":
