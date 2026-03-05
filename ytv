@@ -9,8 +9,10 @@ No account, no API key, no ads.
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -18,13 +20,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ytv"
 CACHE_DIR  = Path(os.environ.get("XDG_CACHE_HOME",  Path.home() / ".cache"))  / "ytv"
 FEED_CACHE = CACHE_DIR / "feeds"
-SUBS_FILE  = CONFIG_DIR / "subscriptions.json"
+SUBS_FILE    = CONFIG_DIR / "subscriptions.json"
+WATCHED_FILE = CONFIG_DIR / "watched.json"
+_SOCK_PATH   = "/tmp/ytv-mpv.sock"
 
 DEFAULT_CONFIG: dict = {
     "cache_ttl":      3600,
@@ -34,7 +38,12 @@ DEFAULT_CONFIG: dict = {
     "mpv_extra_args": [],
     "quality":        "bestvideo[height<=720]+bestaudio/best[height<=720]",
     "audio_quality":  "bestaudio/best",
+    "volume":         100,
 }
+
+# ─── Watched state (module-level, loaded once at startup) ────────────────────
+_watched:  set[str] = set()
+_mpv_mode: dict     = {"audio_only": None}  # tracks current mpv audio/video mode
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -419,6 +428,126 @@ def fetch_channel_yt_dlp(channel_id: str, name: str, limit: int = 30) -> list[di
         })
     return videos
 
+# ─── Watched history ─────────────────────────────────────────────────────────
+
+def _load_watched() -> None:
+    """Populate _watched from disk; called once at startup."""
+    if WATCHED_FILE.exists():
+        try:
+            data = json.loads(WATCHED_FILE.read_text())
+            if isinstance(data, list):
+                _watched.update(data)
+        except Exception:
+            pass
+
+
+def _mark_played(urls: list[str]) -> None:
+    """Record video IDs as watched and persist to disk."""
+    ids = [u.split("v=")[-1].split("&")[0] for u in urls if "v=" in u]
+    if not ids:
+        return
+    _watched.update(ids)
+    try:
+        WATCHED_FILE.write_text(json.dumps(list(_watched)))
+    except Exception:
+        pass
+
+# ─── mpv IPC helpers ─────────────────────────────────────────────────────────
+
+def _send_ipc(command: list) -> bool:
+    """Send a JSON command to the running mpv via IPC socket. Returns True on success."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(_SOCK_PATH)
+        s.sendall((json.dumps({"command": command}) + "\n").encode())
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+def _query_volume() -> int | None:
+    """Read current mpv volume via IPC. Returns 0-200 or None."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(_SOCK_PATH)
+        s.sendall(b'{"command":["get_property","volume"]}\n')
+        data = b""
+        while b"\n" not in data:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        msg = json.loads(data.decode().strip().splitlines()[0])
+        vol = msg.get("data")
+        if vol is not None:
+            return max(0, min(200, round(vol)))
+    except Exception:
+        pass
+    return None
+
+
+def _save_volume(vol: int, config: dict) -> None:
+    """Update in-memory config and persist volume to config.json."""
+    config["volume"] = vol
+    config_file = CONFIG_DIR / "config.json"
+    try:
+        saved: dict = {}
+        if config_file.exists():
+            saved = json.loads(config_file.read_text())
+        saved["volume"] = vol
+        config_file.write_text(json.dumps(saved, indent=2))
+    except Exception:
+        pass
+
+
+def _monitor_volume(config: dict) -> None:
+    """
+    Daemon thread: subscribe to mpv's volume property via IPC.
+    When mpv exits (connection drops), save the last observed volume.
+    """
+    # Wait up to 3 s for mpv to create its IPC socket
+    for _ in range(30):
+        if Path(_SOCK_PATH).exists():
+            break
+        time.sleep(0.1)
+    else:
+        return
+
+    last_vol = None
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(_SOCK_PATH)
+        s.sendall(b'{"command":["observe_property",1,"volume"]}\n')
+        buf = ""
+        while True:
+            try:
+                data = s.recv(4096)
+            except socket.timeout:
+                continue
+            if not data:
+                break  # mpv closed its end
+            buf += data.decode("utf-8", errors="replace")
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                try:
+                    msg = json.loads(line)
+                    if (msg.get("event") == "property-change"
+                            and msg.get("name") == "volume"
+                            and msg.get("data") is not None):
+                        last_vol = msg["data"]
+                except (json.JSONDecodeError, KeyError):
+                    pass
+    except Exception:
+        pass
+
+    if last_vol is not None:
+        _save_volume(max(0, min(200, round(last_vol))), config)
+
 # ─── fzf interface ───────────────────────────────────────────────────────────
 # Line format (6 tab-separated fields):
 #   1: url        ← hidden
@@ -446,6 +575,8 @@ def _fmt_line(v: dict) -> str:
     views   = v.get("views", "").rjust(6) if v.get("views") else " " * 6
     title   = v.get("title", "").replace("\t", " ")
     display = f"{date}  {channel}  {views}  {title}"
+    if v.get("id") in _watched:
+        display = f"\033[2m{display}\033[0m"  # dim watched videos
     return "\t".join([
         v.get("url", ""),
         v.get("channel_id", ""),
@@ -472,6 +603,7 @@ def run_fzf(
     keys  = ["enter", "ctrl-a", "ctrl-y", "ctrl-r"] + (extra_keys or [])
     cmd   = [
         "fzf",
+        "--ansi",
         "--multi",
         "--delimiter=\t",
         "--with-nth=6",
@@ -512,12 +644,43 @@ def _channel_of(lines: list[str]) -> tuple[str, str]:
 # ─── Player ──────────────────────────────────────────────────────────────────
 
 def play_video(urls: list[str], audio_only: bool, config: dict) -> None:
-    cmd = ["mpv"]
+    sock_exists = Path(_SOCK_PATH).exists()
+
+    if sock_exists and _mpv_mode["audio_only"] == audio_only:
+        # Save current volume before replacing, then load new video in-place
+        vol = _query_volume()
+        if vol is not None:
+            _save_volume(vol, config)
+        if _send_ipc(["loadfile", urls[0], "replace"]):
+            for url in urls[1:]:
+                _send_ipc(["loadfile", url, "append"])
+            _mark_played(urls)
+            return
+
+    # Mode switch (audio↔video) or first play: quit running mpv if any
+    if sock_exists:
+        vol = _query_volume()
+        if vol is not None:
+            _save_volume(vol, config)
+        _send_ipc(["quit"])
+        for _ in range(20):          # wait up to 2 s for socket to disappear
+            if not Path(_SOCK_PATH).exists():
+                break
+            time.sleep(0.1)
+
+    # Launch new mpv with IPC socket and saved volume
+    cmd = [
+        "mpv",
+        f"--input-ipc-server={_SOCK_PATH}",
+        f"--volume={config.get('volume', 100)}",
+    ]
     if audio_only:
         cmd += ["--no-video", f"--ytdl-format={config['audio_quality']}"]
     else:
         cmd += [f"--geometry={config['mpv_geometry']}", f"--ytdl-format={config['quality']}"]
     cmd += ["--title=ytv"] + (config.get("mpv_extra_args") or []) + ["--"] + urls
+
+    _mpv_mode["audio_only"] = audio_only
     try:
         subprocess.Popen(
             cmd,
@@ -527,6 +690,10 @@ def play_video(urls: list[str], audio_only: bool, config: dict) -> None:
         )
     except FileNotFoundError:
         die("mpv not found. Install: sudo pacman -S mpv")
+
+    # Daemon thread: observe volume, save when mpv exits
+    threading.Thread(target=_monitor_volume, args=(config,), daemon=True).start()
+    _mark_played(urls)
 
 
 def copy_to_clipboard(text: str) -> bool:
@@ -820,6 +987,7 @@ def cmd_show_config(config: dict) -> None:
     print(f"Max videos:    {config['max_videos']}")
     print(f"mpv geometry:  {config['mpv_geometry']}")
     print(f"Quality:       {config['quality']}")
+    print(f"Volume:        {config.get('volume', 100)}")
     config_file = CONFIG_DIR / "config.json"
     if config_file.exists():
         print(f"\nConfig file: {config_file}")
@@ -889,6 +1057,7 @@ Examples:
 
     for d in (CONFIG_DIR, CACHE_DIR, FEED_CACHE):
         d.mkdir(parents=True, exist_ok=True)
+    _load_watched()
 
     cmd = args.cmd
 
