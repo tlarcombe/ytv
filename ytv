@@ -592,6 +592,7 @@ def run_fzf(
     prompt: str = "ytv> ",
     header: str = "",
     extra_keys: list[str] | None = None,
+    start_pos: int = 0,
 ) -> tuple[str, list[str]] | None:
     """
     Show video list in fzf.
@@ -615,6 +616,8 @@ def run_fzf(
         f"--preview={_PREVIEW}",
         "--preview-window=up:4:wrap",
     ]
+    if start_pos > 0:
+        cmd.append(f"--bind=start:pos({start_pos})")
     try:
         r = subprocess.run(cmd, input=lines, capture_output=True, text=True)
     except FileNotFoundError:
@@ -781,21 +784,32 @@ def cmd_browse(args, config: dict, subs: list[dict]) -> None:
     videos = get_all_videos(subs, config, force=force, verbose=verbose)
     eprint("\r\033[K", end="")
 
+    last_pos = 0  # cursor position to restore in fzf on next iteration
+
     while True:
         if not videos:
             die("No videos found. Run: ytv -r")
 
-        result = run_fzf(videos, header=_MAIN_HDR, extra_keys=["ctrl-s", "ctrl-n"])
+        result = run_fzf(videos, header=_MAIN_HDR, extra_keys=["ctrl-s", "ctrl-n"], start_pos=last_pos)
         if result is None:
             break
 
         key, lines = result
+
+        # Remember where the cursor was so we return to the same item
+        if lines:
+            sel_url = lines[0].split("\t")[0]
+            for i, v in enumerate(videos):
+                if v["url"] == sel_url:
+                    last_pos = i + 1  # fzf pos() is 1-based
+                    break
 
         # ── Refresh ───────────────────────────────────────────────────────────
         if key == "ctrl-r":
             eprint("Refreshing feeds...")
             videos = get_all_videos(subs, config, force=True, verbose=verbose)
             eprint("\r\033[K", end="")
+            last_pos = 0
             continue
 
         # ── Search ────────────────────────────────────────────────────────────
