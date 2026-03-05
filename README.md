@@ -129,9 +129,13 @@ Run `ytv init-config` to create `~/.config/ytv/config.json`:
   "mpv_geometry":   "50%x50%-0+0",
   "mpv_extra_args": [],
   "quality":        "bestvideo[height<=720]+bestaudio/best[height<=720]",
-  "audio_quality":  "bestaudio/best"
+  "audio_quality":  "bestaudio/best",
+  "sticky_window":  false
 }
 ```
+
+Set `sticky_window` to `true` to make the mpv window visible on all virtual desktops
+(uses `wmctrl` or `xdotool` — install either one for this to work).
 
 ### `mpv_geometry` positions
 

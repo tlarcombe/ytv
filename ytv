@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ytv"
@@ -39,6 +39,7 @@ DEFAULT_CONFIG: dict = {
     "quality":        "bestvideo[height<=720]+bestaudio/best[height<=720]",
     "audio_quality":  "bestaudio/best",
     "volume":         100,
+    "sticky_window":  False,
 }
 
 # ─── Watched state (module-level, loaded once at startup) ────────────────────
@@ -723,6 +724,7 @@ def play_video(
         "mpv",
         f"--input-ipc-server={_SOCK_PATH}",
         f"--volume={config.get('volume', 100)}",
+        "--idle=yes",   # stay alive after playlist ends so auto-play IPC works
     ]
     if audio_only:
         cmd += ["--no-video", f"--ytdl-format={config['audio_quality']}"]
@@ -745,7 +747,26 @@ def play_video(
 
     # Daemon thread: observe volume + handle auto-play, save volume when mpv exits
     threading.Thread(target=_monitor_mpv, args=(config,), daemon=True).start()
+    # Daemon thread: make window sticky if configured
+    if not audio_only and config.get("sticky_window"):
+        threading.Thread(target=_apply_sticky, daemon=True).start()
     _mark_played(urls)
+
+
+def _apply_sticky() -> None:
+    """Daemon thread: wait for the ytv mpv window and make it sticky (all workspaces)."""
+    for cmd in (
+        ["wmctrl", "-r", "ytv", "-b", "add,sticky"],
+        ["xdotool", "search", "--name", "ytv", "windowstate", "--add", "STICKY"],
+    ):
+        for _ in range(50):   # poll up to 5 s for the window to appear
+            time.sleep(0.1)
+            try:
+                r = subprocess.run(cmd, capture_output=True)
+                if r.returncode == 0:
+                    return
+            except FileNotFoundError:
+                break   # tool not available — try next
 
 
 def copy_to_clipboard(text: str) -> bool:
@@ -1053,6 +1074,7 @@ def cmd_show_config(config: dict) -> None:
     print(f"mpv geometry:  {config['mpv_geometry']}")
     print(f"Quality:       {config['quality']}")
     print(f"Volume:        {config.get('volume', 100)}")
+    print(f"Sticky window: {config.get('sticky_window', False)}")
     config_file = CONFIG_DIR / "config.json"
     if config_file.exists():
         print(f"\nConfig file: {config_file}")
