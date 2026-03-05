@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ytv"
@@ -42,8 +42,10 @@ DEFAULT_CONFIG: dict = {
 }
 
 # ─── Watched state (module-level, loaded once at startup) ────────────────────
-_watched:  set[str] = set()
-_mpv_mode: dict     = {"audio_only": None}  # tracks current mpv audio/video mode
+_watched:       set[str]  = set()
+_mpv_mode:      dict      = {"audio_only": None}  # tracks current mpv audio/video mode
+_autoplay_queue: list[str] = []
+_autoplay_lock  = threading.Lock()
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -304,8 +306,22 @@ def parse_feed(xml: str, channel_name: str) -> list[dict]:
                 except ValueError:
                     pass
 
-            views = ""
+            # Skip YouTube Shorts (vertical aspect ratio or #shorts tag)
+            if "#short" in title.lower():
+                continue
             mg = entry.find("media:group", _NS)
+            if mg is not None:
+                mc = mg.find("media:content", _NS)
+                if mc is not None:
+                    try:
+                        w = int(mc.get("width") or 0)
+                        h = int(mc.get("height") or 0)
+                        if h > w > 0:  # vertical = Short
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+
+            views = ""
             if mg is not None:
                 st = mg.find("media:community/media:statistics", _NS)
                 if st is not None:
@@ -358,7 +374,7 @@ def search_youtube(query: str, config: dict, limit: int = 25) -> list[dict]:
     """Search YouTube via yt-dlp. Returns video list."""
     cmd = [
         "yt-dlp", "--flat-playlist", f"--playlist-end={limit}",
-        "--print=%(title)s\t%(id)s\t%(channel_id)s\t%(channel)s\t%(view_count)s",
+        "--print=%(title)s\t%(id)s\t%(channel_id)s\t%(channel)s\t%(view_count)s\t%(webpage_url)s",
         "--quiet", "--no-warnings",
         f"ytsearch{limit}:{query}",
     ]
@@ -372,7 +388,8 @@ def search_youtube(query: str, config: dict, limit: int = 25) -> list[dict]:
         if len(parts) < 5:
             continue
         title, vid_id, cid, channel, views = (p if p != "NA" else "" for p in parts[:5])
-        if not vid_id:
+        webpage_url = parts[5] if len(parts) > 5 else ""
+        if not vid_id or "/shorts/" in webpage_url:
             continue
         videos.append({
             "url":        f"https://www.youtube.com/watch?v={vid_id}",
@@ -393,7 +410,7 @@ def fetch_channel_yt_dlp(channel_id: str, name: str, limit: int = 30) -> list[di
         "yt-dlp", "--flat-playlist", "--lazy-playlist",
         f"--playlist-end={limit}",
         "--extractor-args=youtubetab:approximate_date",
-        "--print=%(title)s\t%(id)s\t%(timestamp)s\t%(channel)s\t%(view_count)s",
+        "--print=%(title)s\t%(id)s\t%(timestamp)s\t%(channel)s\t%(view_count)s\t%(webpage_url)s",
         "--quiet", "--no-warnings",
         f"https://www.youtube.com/channel/{channel_id}/videos",
     ]
@@ -407,7 +424,8 @@ def fetch_channel_yt_dlp(channel_id: str, name: str, limit: int = 30) -> list[di
         if len(parts) < 5:
             continue
         title, vid_id, ts_str, channel, views = (p if p != "NA" else "" for p in parts[:5])
-        if not vid_id:
+        webpage_url = parts[5] if len(parts) > 5 else ""
+        if not vid_id or "/shorts/" in webpage_url:
             continue
         pub_ts = 0.0
         pub_date = ""
@@ -451,6 +469,22 @@ def _mark_played(urls: list[str]) -> None:
         WATCHED_FILE.write_text(json.dumps(list(_watched)))
     except Exception:
         pass
+
+def _next_unwatched(videos: list[dict], sel_urls: list[str], limit: int = 10) -> list[str]:
+    """Return up to `limit` unwatched video URLs immediately following the selection."""
+    if not sel_urls:
+        return []
+    sel_set = set(sel_urls)
+    last_idx = -1
+    for i, v in enumerate(videos):
+        if v["url"] in sel_set:
+            last_idx = i
+    if last_idx < 0:
+        return []
+    return [
+        v["url"] for v in videos[last_idx + 1:]
+        if v.get("id") not in _watched
+    ][:limit]
 
 # ─── mpv IPC helpers ─────────────────────────────────────────────────────────
 
@@ -504,10 +538,11 @@ def _save_volume(vol: int, config: dict) -> None:
         pass
 
 
-def _monitor_volume(config: dict) -> None:
+def _monitor_mpv(config: dict) -> None:
     """
     Daemon thread: subscribe to mpv's volume property via IPC.
     When mpv exits (connection drops), save the last observed volume.
+    Also handles auto-play: when a file ends naturally, plays next from queue.
     """
     # Wait up to 3 s for mpv to create its IPC socket
     for _ in range(30):
@@ -536,10 +571,17 @@ def _monitor_volume(config: dict) -> None:
                 line, buf = buf.split("\n", 1)
                 try:
                     msg = json.loads(line)
-                    if (msg.get("event") == "property-change"
+                    event = msg.get("event")
+                    if (event == "property-change"
                             and msg.get("name") == "volume"
                             and msg.get("data") is not None):
                         last_vol = msg["data"]
+                    elif event == "end-file" and msg.get("reason") == "eof":
+                        with _autoplay_lock:
+                            if _autoplay_queue:
+                                next_url = _autoplay_queue.pop(0)
+                                _mark_played([next_url])
+                                _send_ipc(["loadfile", next_url, "replace"])
                 except (json.JSONDecodeError, KeyError):
                     pass
     except Exception:
@@ -646,7 +688,10 @@ def _channel_of(lines: list[str]) -> tuple[str, str]:
 
 # ─── Player ──────────────────────────────────────────────────────────────────
 
-def play_video(urls: list[str], audio_only: bool, config: dict) -> None:
+def play_video(
+    urls: list[str], audio_only: bool, config: dict, upcoming: list[str] | None = None
+) -> None:
+    global _autoplay_queue
     sock_exists = Path(_SOCK_PATH).exists()
 
     if sock_exists and _mpv_mode["audio_only"] == audio_only:
@@ -657,6 +702,8 @@ def play_video(urls: list[str], audio_only: bool, config: dict) -> None:
         if _send_ipc(["loadfile", urls[0], "replace"]):
             for url in urls[1:]:
                 _send_ipc(["loadfile", url, "append"])
+            with _autoplay_lock:
+                _autoplay_queue = list(upcoming or [])
             _mark_played(urls)
             return
 
@@ -683,6 +730,8 @@ def play_video(urls: list[str], audio_only: bool, config: dict) -> None:
         cmd += [f"--geometry={config['mpv_geometry']}", f"--ytdl-format={config['quality']}"]
     cmd += ["--title=ytv"] + (config.get("mpv_extra_args") or []) + ["--"] + urls
 
+    with _autoplay_lock:
+        _autoplay_queue = list(upcoming or [])
     _mpv_mode["audio_only"] = audio_only
     try:
         subprocess.Popen(
@@ -694,8 +743,8 @@ def play_video(urls: list[str], audio_only: bool, config: dict) -> None:
     except FileNotFoundError:
         die("mpv not found. Install: sudo pacman -S mpv")
 
-    # Daemon thread: observe volume, save when mpv exits
-    threading.Thread(target=_monitor_volume, args=(config,), daemon=True).start()
+    # Daemon thread: observe volume + handle auto-play, save volume when mpv exits
+    threading.Thread(target=_monitor_mpv, args=(config,), daemon=True).start()
     _mark_played(urls)
 
 
@@ -767,7 +816,8 @@ def show_panel(videos: list[dict], subs: list[dict], config: dict, title: str) -
             continue
 
         if key in ("enter", "ctrl-a"):
-            play_video(urls, audio_only=(key == "ctrl-a"), config=config)
+            upcoming = _next_unwatched(videos, urls)
+            play_video(urls, audio_only=(key == "ctrl-a"), config=config, upcoming=upcoming)
             continue  # stay in panel after playing
 
 # ─── Commands ────────────────────────────────────────────────────────────────
@@ -858,7 +908,8 @@ def cmd_browse(args, config: dict, subs: list[dict]) -> None:
             continue
 
         if key in ("enter", "ctrl-a") or audio:
-            play_video(urls, audio_only=(key == "ctrl-a" or audio), config=config)
+            upcoming = _next_unwatched(videos, urls)
+            play_video(urls, audio_only=(key == "ctrl-a" or audio), config=config, upcoming=upcoming)
             continue  # ← stay in ytv after launching mpv
 
 
