@@ -718,6 +718,11 @@ def play_video(
             if not Path(_SOCK_PATH).exists():
                 break
             time.sleep(0.1)
+    # Remove stale socket file so mpv can bind a fresh one
+    try:
+        Path(_SOCK_PATH).unlink(missing_ok=True)
+    except OSError:
+        pass
 
     # Launch new mpv with IPC socket and saved volume
     cmd = [
