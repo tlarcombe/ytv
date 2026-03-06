@@ -761,53 +761,78 @@ def play_video(
     _mark_played(urls)
 
 
-def _apply_sticky() -> None:
-    """
-    Daemon thread: query mpv's window ID via IPC, then make it sticky
-    (visible on all workspaces).  Uses the window ID directly to avoid
-    accidentally targeting the terminal window which also carries the
-    title 'ytv'.
-    """
-    # Wait for mpv to create the IPC socket and open its window
-    win_id = None
-    for _ in range(50):   # up to 5 s
-        time.sleep(0.1)
-        if not Path(_SOCK_PATH).exists():
-            continue
-        try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(1.0)
-            s.connect(_SOCK_PATH)
-            s.sendall(b'{"command":["get_property","window-id"]}\n')
-            data = b""
-            while b"\n" not in data:
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-            s.close()
-            msg = json.loads(data.decode().strip().splitlines()[0])
-            wid = msg.get("data")
-            if isinstance(wid, int) and wid > 0:
-                win_id = wid
+def _ipc_get(prop: str):
+    """Read a single mpv property via IPC. Returns the value or None."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(_SOCK_PATH)
+        s.sendall((json.dumps({"command": ["get_property", prop]}) + "\n").encode())
+        data = b""
+        while b"\n" not in data:
+            chunk = s.recv(4096)
+            if not chunk:
                 break
-        except Exception:
-            pass
+            data += chunk
+        s.close()
+        msg = json.loads(data.decode().strip().splitlines()[0])
+        if msg.get("error") == "success":
+            return msg.get("data")
+    except Exception:
+        pass
+    return None
 
-    if win_id is None:
-        return
 
+def _set_sticky(win_id: int) -> bool:
+    """Apply sticky (_NET_WM_STATE_STICKY) to the given X11 window."""
     hex_id = hex(win_id)
     for cmd in (
         ["wmctrl", "-i", "-r", hex_id, "-b", "add,sticky"],
         ["xdotool", "windowstate", "--add", "STICKY", str(win_id)],
     ):
         try:
-            r = subprocess.run(cmd, capture_output=True)
-            if r.returncode == 0:
-                return
+            if subprocess.run(cmd, capture_output=True).returncode == 0:
+                return True
         except FileNotFoundError:
             continue
+    return False
+
+
+def _apply_sticky() -> None:
+    """
+    Daemon thread: make the mpv window sticky (visible on all workspaces).
+    Applied twice: immediately when the window appears, then again after
+    playback starts — XFCE resets sticky when mpv remaps its window as
+    the video begins loading.
+    """
+    # Wait for the IPC socket and a valid window-id
+    win_id = None
+    for _ in range(50):   # up to 5 s
+        time.sleep(0.1)
+        if not Path(_SOCK_PATH).exists():
+            continue
+        wid = _ipc_get("window-id")
+        if isinstance(wid, int) and wid > 0:
+            win_id = wid
+            break
+
+    if win_id is None:
+        return
+
+    # First application: window exists but video may not be playing yet
+    _set_sticky(win_id)
+
+    # Wait for playback to start (time-pos becomes non-null)
+    for _ in range(100):   # up to 10 s
+        time.sleep(0.1)
+        if not Path(_SOCK_PATH).exists():
+            return
+        if _ipc_get("time-pos") is not None:
+            break
+
+    # Re-apply after a brief settle — XFCE may have cleared sticky during load
+    time.sleep(0.5)
+    _set_sticky(win_id)
 
 
 def copy_to_clipboard(text: str) -> bool:
