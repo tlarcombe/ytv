@@ -705,6 +705,9 @@ def play_video(
                 _send_ipc(["loadfile", url, "append"])
             with _autoplay_lock:
                 _autoplay_queue = list(upcoming or [])
+            # Re-apply sticky: XFCE may reset it when the window title changes
+            if not audio_only and config.get("sticky_window"):
+                threading.Thread(target=_apply_sticky, daemon=True).start()
             _mark_played(urls)
             return
 
