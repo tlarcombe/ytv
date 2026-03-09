@@ -800,17 +800,17 @@ def _set_sticky(win_id: int) -> bool:
 
 def _apply_sticky() -> None:
     """
-    Daemon thread: make the mpv window sticky (visible on all workspaces).
-    Applied twice: immediately when the window appears, then again after
-    playback starts — XFCE resets sticky when mpv remaps its window as
-    the video begins loading.
+    Daemon thread: keep the mpv window sticky for its entire lifetime.
+    XFCE clears _NET_WM_STATE_STICKY when mpv remaps its window during
+    video load, so we poll every second and re-apply whenever it's gone.
+    Exits when the IPC socket disappears (mpv quit).
     """
     # Wait for the IPC socket and a valid window-id
     win_id = None
     for _ in range(50):   # up to 5 s
         time.sleep(0.1)
         if not Path(_SOCK_PATH).exists():
-            continue
+            return
         wid = _ipc_get("window-id")
         if isinstance(wid, int) and wid > 0:
             win_id = wid
@@ -819,20 +819,20 @@ def _apply_sticky() -> None:
     if win_id is None:
         return
 
-    # First application: window exists but video may not be playing yet
-    _set_sticky(win_id)
+    win_id_str = str(win_id)
 
-    # Wait for playback to start (time-pos becomes non-null)
-    for _ in range(100):   # up to 10 s
-        time.sleep(0.1)
-        if not Path(_SOCK_PATH).exists():
-            return
-        if _ipc_get("time-pos") is not None:
-            break
-
-    # Re-apply after a brief settle — XFCE may have cleared sticky during load
-    time.sleep(0.5)
-    _set_sticky(win_id)
+    # Poll once per second; re-apply sticky if XFCE has cleared it
+    while Path(_SOCK_PATH).exists():
+        try:
+            r = subprocess.run(
+                ["xprop", "-id", win_id_str, "_NET_WM_STATE"],
+                capture_output=True, text=True,
+            )
+            if "_NET_WM_STATE_STICKY" not in r.stdout:
+                _set_sticky(win_id)
+        except Exception:
+            pass
+        time.sleep(1.0)
 
 
 def copy_to_clipboard(text: str) -> bool:
