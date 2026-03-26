@@ -206,7 +206,7 @@ def load_subs() -> list[dict]:
 def resolve_channel(url: str) -> dict | None:
     """Resolve a YouTube URL to {id, name} using yt-dlp."""
     cmd = [
-        "yt-dlp", "--playlist-items=0",
+        "yt-dlp", "--playlist-items=1",
         "--print=%(channel_id)s", "--print=%(channel)s",
         "--quiet", "--no-warnings", url,
     ]
