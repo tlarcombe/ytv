@@ -1037,6 +1037,9 @@ def cmd_add(args, config: dict, subs: list[dict]) -> None:
     if is_url:
         if not target.startswith("http"):
             target = f"https://www.youtube.com/{target}"
+        # yt-dlp resolves @handle URLs more reliably via the /videos tab
+        if "/@" in target and not any(target.endswith(s) for s in ("/videos", "/about", "/featured")):
+            target = target.rstrip("/") + "/videos"
         eprint("Resolving channel...")
         resolved = resolve_channel(target)
         if not resolved:
