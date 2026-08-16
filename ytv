@@ -579,11 +579,19 @@ def _monitor_mpv(config: dict) -> None:
                             and msg.get("data") is not None):
                         last_vol = msg["data"]
                     elif event == "end-file" and msg.get("reason") == "eof":
-                        with _autoplay_lock:
-                            if _autoplay_queue:
+                        # Keep trying subsequent queue entries if a video fails
+                        # to load (bad/expired extraction) instead of silently
+                        # going idle and looking like auto-play just stopped.
+                        while True:
+                            with _autoplay_lock:
+                                if not _autoplay_queue:
+                                    break
                                 next_url = _autoplay_queue.pop(0)
-                                _mark_played([next_url])
-                                _send_ipc(["loadfile", next_url, "replace"])
+                            _mark_played([next_url])
+                            if (_send_ipc(["loadfile", next_url, "replace"])
+                                    and _wait_for_load(next_url)):
+                                break
+                            warn("Autoplay: next video failed to load, trying the following one...")
                 except (json.JSONDecodeError, KeyError):
                     pass
     except Exception:
