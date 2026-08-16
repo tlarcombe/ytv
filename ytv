@@ -9,6 +9,7 @@ No account, no API key, no ads.
 import argparse
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -689,6 +690,106 @@ def _channel_of(lines: list[str]) -> tuple[str, str]:
 
 # ─── Player ──────────────────────────────────────────────────────────────────
 
+_MPV_LOG = CACHE_DIR / "mpv.log"
+
+
+def _confirm_playing(check_loaded, timeout: float = 6.0, settle: float = 1.5) -> bool:
+    """
+    Poll check_loaded() until it reports the target file is loaded, then
+    require it to stay true for `settle` seconds before declaring success.
+
+    The settle window matters: on a bad/unextractable URL, mpv (with
+    --idle=yes) often flips idle-active False the instant it *attempts* to
+    load a file, then bounces back to idle a second or two later once
+    yt-dlp extraction fails. Without the settle check that transient dip
+    reads as "it's playing" even though playback never actually started.
+    """
+    deadline = time.monotonic() + timeout
+    first_ok = None
+    while time.monotonic() < deadline:
+        if not Path(_SOCK_PATH).exists():
+            return False
+        if check_loaded():
+            if first_ok is None:
+                first_ok = time.monotonic()
+            elif time.monotonic() - first_ok >= settle:
+                return True
+        else:
+            first_ok = None
+        time.sleep(0.2)
+    return False
+
+
+def _wait_for_playing(timeout: float = 6.0) -> bool:
+    """Confirm mpv actually started (and stayed) playing after a fresh launch."""
+    return _confirm_playing(lambda: _ipc_get("idle-active") is False, timeout)
+
+
+def _wait_for_load(expected_url: str, timeout: float = 6.0) -> bool:
+    """
+    Confirm mpv loaded (and stayed on) the given URL after an in-place
+    "loadfile replace" — idle-active alone is unreliable here since it may
+    already be False from the video that was just playing, giving a false
+    positive before the new file has actually loaded.
+    """
+    return _confirm_playing(
+        lambda: _ipc_get("path") == expected_url and _ipc_get("idle-active") is False,
+        timeout,
+    )
+
+
+def _mpv_log_tail(n: int = 8) -> str:
+    try:
+        lines = _MPV_LOG.read_text(errors="replace").splitlines()
+        return "\n".join(lines[-n:])
+    except OSError:
+        return ""
+
+
+_MPV_PID_FILE = CACHE_DIR / "mpv.pid"
+
+
+def _write_mpv_pid(pid: int) -> None:
+    try:
+        _MPV_PID_FILE.write_text(str(pid))
+    except OSError:
+        pass
+
+
+def _is_our_mpv(pid: int) -> bool:
+    """Guard against killing an unrelated process if the PID got reused."""
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    return b"mpv" in cmdline and _SOCK_PATH.encode() in cmdline
+
+
+def _hard_kill_stale_mpv() -> None:
+    """
+    Last-resort cleanup: if a previous mpv never released the IPC socket
+    (graceful "quit" ignored or too slow), kill it directly by PID instead
+    of abandoning it. Left unchecked, orphaned mpv processes pile up and
+    fight the new one for the audio device / CPU / network — the actual
+    cause of "sometimes doesn't play at all" after a few failed attempts.
+    """
+    try:
+        pid = int(_MPV_PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return
+    if not _is_our_mpv(pid):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(10):            # up to 1 s for a clean exit
+            time.sleep(0.1)
+            if not _is_our_mpv(pid):
+                return
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def play_video(
     urls: list[str], audio_only: bool, config: dict, upcoming: list[str] | None = None
 ) -> None:
@@ -700,7 +801,7 @@ def play_video(
         vol = _query_volume()
         if vol is not None:
             _save_volume(vol, config)
-        if _send_ipc(["loadfile", urls[0], "replace"]):
+        if _send_ipc(["loadfile", urls[0], "replace"]) and _wait_for_load(urls[0]):
             for url in urls[1:]:
                 _send_ipc(["loadfile", url, "append"])
             with _autoplay_lock:
@@ -710,6 +811,10 @@ def play_video(
                 threading.Thread(target=_apply_sticky, daemon=True).start()
             _mark_played(urls)
             return
+        # In-place reload didn't take (mpv wedged or crashed) — fall through
+        # and relaunch mpv from scratch instead of leaving the user stuck.
+        warn("Fast reload failed, restarting player...")
+        sock_exists = Path(_SOCK_PATH).exists()
 
     # Mode switch (audio↔video) or first play: quit running mpv if any
     if sock_exists:
@@ -721,6 +826,12 @@ def play_video(
             if not Path(_SOCK_PATH).exists():
                 break
             time.sleep(0.1)
+        else:
+            # Graceful quit didn't take — don't just abandon it. An orphaned
+            # mpv left running silently fights the new one for the audio
+            # device / CPU, which is what caused playback to intermittently
+            # fail or need several attempts.
+            _hard_kill_stale_mpv()
     # Remove stale socket file so mpv can bind a fresh one
     try:
         Path(_SOCK_PATH).unlink(missing_ok=True)
@@ -744,14 +855,34 @@ def play_video(
         _autoplay_queue = list(upcoming or [])
     _mpv_mode["audio_only"] = audio_only
     try:
-        subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(_MPV_LOG, "wb") as logf:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=logf,   # mpv writes most diagnostics (incl. ytdl-hook errors) to stdout
+                stderr=logf,
+            )
+        _write_mpv_pid(proc.pid)
     except FileNotFoundError:
         die("mpv not found. Install: sudo pacman -S mpv")
+
+    # Give mpv a moment to crash-fail fast (bad args, missing ytdl hook, etc.)
+    # before assuming it's up — surfaces failures instead of silently
+    # returning to the browser as if nothing happened.
+    time.sleep(0.3)
+    if proc.poll() is not None:
+        tail = _mpv_log_tail()
+        warn(f"mpv exited immediately (code {proc.returncode}).")
+        if tail:
+            eprint(tail)
+        return
+
+    if not _wait_for_playing():
+        tail = _mpv_log_tail()
+        warn("mpv didn't start playback — the video may have failed to load.")
+        if tail:
+            eprint(tail)
 
     # Daemon thread: observe volume + handle auto-play, save volume when mpv exits
     threading.Thread(target=_monitor_mpv, args=(config,), daemon=True).start()
