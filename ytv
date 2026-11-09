@@ -852,6 +852,10 @@ def play_video(
         f"--input-ipc-server={_SOCK_PATH}",
         f"--volume={config.get('volume', 100)}",
         "--idle=yes",   # stay alive after playlist ends so auto-play IPC works
+        # YouTube's default (web) player client increasingly triggers
+        # "Sign in to confirm you're not a bot" / 429 even for ordinary
+        # public videos. The android client isn't subject to that check.
+        "--ytdl-raw-options=extractor-args=youtube:player_client=android",
     ]
     if audio_only:
         cmd += ["--no-video", f"--ytdl-format={config['audio_quality']}"]
