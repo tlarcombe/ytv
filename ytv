@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "2.2.1"
+VERSION = "2.3.0"
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ytv"
@@ -226,35 +226,79 @@ _FEED_URL  = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 _UA        = "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
 
 
-def fetch_channel_feed(
-    channel_id: str, name: str, cache_ttl: int, force: bool = False
-) -> tuple[str, str] | None:
-    """Fetch RSS feed. Returns (name, xml) or None. Falls back to stale cache."""
-    cache = FEED_CACHE / f"{channel_id}.xml"
-    if not force and cache.exists():
-        if time.time() - cache.stat().st_mtime < cache_ttl:
-            try:
-                return name, cache.read_text()
-            except OSError:
-                pass
+def _fetch_rss(channel_id: str) -> str | None:
+    """Fetch a channel's RSS feed XML, or None on any failure (e.g. 404)."""
     try:
         req = urllib.request.Request(
             _FEED_URL.format(channel_id=channel_id), headers={"User-Agent": _UA}
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            xml = resp.read().decode("utf-8", errors="replace")
-        FEED_CACHE.mkdir(parents=True, exist_ok=True)
-        tmp = cache.with_suffix(".tmp")
-        tmp.write_text(xml)
-        tmp.rename(cache)
-        return name, xml
+            return resp.read().decode("utf-8", errors="replace")
     except Exception:
-        if cache.exists():
-            try:
-                return name, cache.read_text()
-            except OSError:
-                pass
         return None
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    try:
+        FEED_CACHE.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(text)
+        tmp.rename(path)
+    except OSError:
+        pass
+
+
+def _read_cache(path: Path, name: str) -> list[dict] | None:
+    """Parse a cached feed (.xml = RSS, .json = yt-dlp). None if unusable."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    if path.suffix == ".xml":
+        return parse_feed(text, name)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, list) else None
+
+
+def _newest_cache(channel_id: str) -> Path | None:
+    candidates = [FEED_CACHE / f"{channel_id}{ext}" for ext in (".xml", ".json")]
+    existing = [c for c in candidates if c.exists()]
+    return max(existing, key=lambda c: c.stat().st_mtime, default=None)
+
+
+def fetch_channel_videos(
+    channel_id: str, name: str, cache_ttl: int, force: bool = False
+) -> tuple[list[dict], bool]:
+    """Return (videos, fresh) for one channel.
+
+    Order: fresh cache → RSS → yt-dlp → stale cache. YouTube's RSS endpoint
+    has been returning 404 for long stretches (Oct/Nov 2026), so yt-dlp is
+    the fallback. `fresh` is False only when we had to serve stale data.
+    """
+    cache = _newest_cache(channel_id)
+    if not force and cache and time.time() - cache.stat().st_mtime < cache_ttl:
+        videos = _read_cache(cache, name)
+        if videos is not None:
+            return videos, True
+
+    xml = _fetch_rss(channel_id)
+    if xml is not None:
+        videos = parse_feed(xml, name)
+        if videos or "<feed" in xml:
+            _atomic_write(FEED_CACHE / f"{channel_id}.xml", xml)
+            return videos, True
+
+    videos = fetch_channel_yt_dlp(channel_id, name, limit=15)
+    if videos:
+        _atomic_write(FEED_CACHE / f"{channel_id}.json", json.dumps(videos))
+        return videos, True
+
+    if cache:
+        return _read_cache(cache, name) or [], False
+    return [], False
 
 
 _NS = {
@@ -346,29 +390,31 @@ def parse_feed(xml: str, channel_name: str) -> list[dict]:
 
 def get_all_videos(
     subs: list[dict], config: dict, force: bool = False, verbose: bool = False
-) -> list[dict]:
-    """Fetch and aggregate feeds from all subscriptions in parallel."""
+) -> tuple[list[dict], int]:
+    """Fetch all subscriptions in parallel. Returns (videos, stale_count)."""
     total = len(subs)
     all_videos: list[dict] = []
+    stale = 0
     done = 0
 
     with ThreadPoolExecutor(max_workers=config["fetch_workers"]) as pool:
-        futures = {
-            pool.submit(fetch_channel_feed, s["id"], s["name"], config["cache_ttl"], force): s
+        futures = [
+            pool.submit(fetch_channel_videos, s["id"], s["name"], config["cache_ttl"], force)
             for s in subs
-        }
+        ]
         for future in as_completed(futures):
             done += 1
             if verbose:
                 eprint(f"\r  {done}/{total} channels fetched...", end="")
-            r = future.result()
-            if r:
-                all_videos.extend(parse_feed(r[1], r[0]))
+            videos, fresh = future.result()
+            all_videos.extend(videos)
+            if not fresh:
+                stale += 1
 
     if verbose:
         eprint()
     all_videos.sort(key=lambda v: v["ts"], reverse=True)
-    return all_videos[: config["max_videos"]]
+    return all_videos[: config["max_videos"]], stale
 
 # ─── yt-dlp helpers (search / channel deep-dive) ─────────────────────────────
 
@@ -615,6 +661,13 @@ _MAIN_HDR   = (
     "ENTER:play  CTRL-A:audio  CTRL-Y:copy URL  "
     "CTRL-S:search  CTRL-N:more from channel  CTRL-R:refresh  TAB:multi-select"
 )
+def main_header(stale: int) -> str:
+    """Main-feed header, with a warning line when some feeds couldn't refresh."""
+    if not stale:
+        return _MAIN_HDR
+    return f"⚠ {stale} feeds stale (RSS and yt-dlp both failed — showing cached)\n{_MAIN_HDR}"
+
+
 _EXTRA_HDR  = (
     "ENTER:play  CTRL-A:audio  CTRL-Y:copy URL  "
     "CTRL-B:subscribe to channel  TAB:multi-select  ESC:back"
@@ -1061,7 +1114,7 @@ def cmd_browse(args, config: dict, subs: list[dict]) -> None:
     audio   = getattr(args, "audio",   False)
 
     eprint(f"ytv {VERSION}  │  {len(subs)} subscriptions  │  fetching feeds...")
-    videos = get_all_videos(subs, config, force=force, verbose=verbose)
+    videos, stale = get_all_videos(subs, config, force=force, verbose=verbose)
     eprint("\r\033[K", end="")
 
     last_pos = 0  # cursor position to restore in fzf on next iteration
@@ -1070,7 +1123,7 @@ def cmd_browse(args, config: dict, subs: list[dict]) -> None:
         if not videos:
             die("No videos found. Run: ytv -r")
 
-        result = run_fzf(videos, header=_MAIN_HDR, extra_keys=["ctrl-s", "ctrl-n"], start_pos=last_pos)
+        result = run_fzf(videos, header=main_header(stale), extra_keys=["ctrl-s", "ctrl-n"], start_pos=last_pos)
         if result is None:
             break
 
@@ -1087,7 +1140,7 @@ def cmd_browse(args, config: dict, subs: list[dict]) -> None:
         # ── Refresh ───────────────────────────────────────────────────────────
         if key == "ctrl-r":
             eprint("Refreshing feeds...")
-            videos = get_all_videos(subs, config, force=True, verbose=verbose)
+            videos, stale = get_all_videos(subs, config, force=True, verbose=verbose)
             eprint("\r\033[K", end="")
             last_pos = 0
             continue

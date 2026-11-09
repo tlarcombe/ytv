@@ -11,7 +11,13 @@ using fzf + mpv. No account, no API key, no ads.
 - **Subscriptions**: `~/.config/ytv/subscriptions.json` (list of {id, name})
   - Auto-migrates from `~/.config/FreeTube/profiles.db` on first run if present
 - **Search / recommendations**: yt-dlp `ytsearch` and flat-playlist
-- **Cache**: `~/.cache/ytv/feeds/<channel_id>.xml`, TTL-based (default 1 hour)
+- **Feed fallback**: YouTube's RSS endpoint has been 404ing for long stretches
+  (Oct/Nov 2026). `fetch_channel_videos()` tries fresh cache → RSS → yt-dlp
+  (`/channel/<id>/videos`, 15 items) → stale cache. Channels served stale are
+  counted and shown as a "⚠ N feeds stale" line in the fzf header.
+- **Cache**: `~/.cache/ytv/feeds/<channel_id>.xml` (RSS) or `.json` (yt-dlp),
+  newest wins, TTL-based (default 1 hour)
+- **Tests**: `python3 -m unittest discover -s tests` (stdlib only, mocked network)
 - **Player**: mpv with `--geometry=50%x50%-0+0` (top-right quarter of screen)
 - **Selector**: fzf, 6-field tab-separated (url+channel_id hidden, display shown)
 
