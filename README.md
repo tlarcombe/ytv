@@ -98,6 +98,7 @@ ytv init-config          Write editable config.json
 |-----|--------|
 | `ENTER` | Play selected video(s) |
 | `CTRL-A` | Play audio only |
+| `CTRL-D` | Download to your library folder (background) |
 | `CTRL-Y` | Copy URL(s) to clipboard |
 | `CTRL-S` | Search YouTube |
 | `CTRL-N` | Load more videos from this channel |
@@ -111,6 +112,7 @@ ytv init-config          Write editable config.json
 |-----|--------|
 | `ENTER` | Play |
 | `CTRL-A` | Audio only |
+| `CTRL-D` | Download |
 | `CTRL-B` | Subscribe to this channel |
 | `CTRL-Y` | Copy URL |
 | `ESC` | Back to browse |
@@ -130,9 +132,23 @@ Run `ytv init-config` to create `~/.config/ytv/config.json`:
   "mpv_extra_args": [],
   "quality":        "bestvideo[height<=720]+bestaudio/best[height<=720]",
   "audio_quality":  "bestaudio/best",
-  "sticky_window":  false
+  "sticky_window":  false,
+  "download_dir":   "~/Videos/ytv",
+  "download_format": "bv*[height<=1080][vcodec^=avc1]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b"
 }
 ```
+
+### Downloading for a media centre
+
+`CTRL-D` (or `ytv download <url>...`) saves the selected video(s) into
+`download_dir`, one folder per channel, as H.264/AAC MP4 with a matching `.jpg`
+thumbnail — a format Kodi, Jellyfin and Plex play on almost anything, including
+a Raspberry Pi. Point `download_dir` at a network share and the video appears on
+your media centre once it finishes. If `download_dir` doesn't exist ytv creates
+it, but only when its parent folder exists (so an unmounted share is reported
+rather than silently filling your local disk). In the browser downloads run in
+the background and you get a desktop notification when they finish; the log is
+`~/.cache/ytv/downloads.log`. Videos already downloaded are skipped.
 
 Set `sticky_window` to `true` to make the mpv window visible on all virtual desktops
 (uses `wmctrl` or `xdotool` — install either one for this to work).

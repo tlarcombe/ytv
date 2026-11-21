@@ -9,6 +9,7 @@ No account, no API key, no ads.
 import argparse
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -21,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ytv"
@@ -41,6 +42,13 @@ DEFAULT_CONFIG: dict = {
     "audio_quality":  "bestaudio/best",
     "volume":         100,
     "sticky_window":  False,
+    # Where CTRL-D / `ytv download` saves videos (e.g. a NAS share Kodi reads).
+    "download_dir":    "~/Videos/ytv",
+    # H.264 + AAC in MP4 plays everywhere, incl. Raspberry Pi hardware decode.
+    "download_format": (
+        "bv*[height<=1080][vcodec^=avc1]+ba[ext=m4a]"
+        "/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b"
+    ),
 }
 
 # ─── Watched state (module-level, loaded once at startup) ────────────────────
@@ -658,7 +666,7 @@ def _monitor_mpv(config: dict) -> None:
 _PREVIEW = "printf 'Channel:  {4}\\nDate:     {3}\\nViews:    {5}\\nURL:      {1}'"
 
 _MAIN_HDR   = (
-    "ENTER:play  CTRL-A:audio  CTRL-Y:copy URL  "
+    "ENTER:play  CTRL-A:audio  CTRL-D:download  CTRL-Y:copy URL  "
     "CTRL-S:search  CTRL-N:more from channel  CTRL-R:refresh  TAB:multi-select"
 )
 def main_header(stale: int) -> str:
@@ -669,7 +677,7 @@ def main_header(stale: int) -> str:
 
 
 _EXTRA_HDR  = (
-    "ENTER:play  CTRL-A:audio  CTRL-Y:copy URL  "
+    "ENTER:play  CTRL-A:audio  CTRL-D:download  CTRL-Y:copy URL  "
     "CTRL-B:subscribe to channel  TAB:multi-select  ESC:back"
 )
 
@@ -706,7 +714,7 @@ def run_fzf(
     if not videos:
         return None
     lines = "\n".join(_fmt_line(v) for v in videos)
-    keys  = ["enter", "ctrl-a", "ctrl-y", "ctrl-r"] + (extra_keys or [])
+    keys  = ["enter", "ctrl-a", "ctrl-d", "ctrl-y", "ctrl-r"] + (extra_keys or [])
     cmd   = [
         "fzf",
         "--ansi",
@@ -1047,6 +1055,94 @@ def copy_to_clipboard(text: str) -> bool:
             continue
     return False
 
+# ─── Download ────────────────────────────────────────────────────────────────
+
+_DOWNLOAD_LOG = CACHE_DIR / "downloads.log"
+# One folder per channel; Kodi picks up "<name>.jpg" as the video's thumbnail.
+_DOWNLOAD_TEMPLATE = "%(channel,uploader|Unknown)s/%(title)s [%(id)s].%(ext)s"
+
+
+def download_dir(config: dict) -> tuple[Path | None, str]:
+    """
+    Resolve (and create if needed) the download directory.
+    Only the final directory is created: if its parent is missing the share
+    is probably not mounted, and writing to the bare mountpoint would fill the
+    local disk instead. Returns (path, "") or (None, error_message).
+    """
+    dest = Path(str(config.get("download_dir") or DEFAULT_CONFIG["download_dir"])).expanduser()
+    if dest.is_dir():
+        return dest, ""
+    if not dest.parent.is_dir():
+        return None, f"{dest.parent} not found — is the NAS mounted?"
+    try:
+        dest.mkdir()
+    except OSError as e:
+        return None, f"Cannot create {dest}: {e}"
+    return dest, ""
+
+
+def download_cmd(urls: list[str], dest: Path, config: dict) -> list[str]:
+    return [
+        "yt-dlp",
+        "--no-playlist",
+        "-f", config.get("download_format") or DEFAULT_CONFIG["download_format"],
+        "--merge-output-format", "mp4",
+        "-P", str(dest),
+        "-o", _DOWNLOAD_TEMPLATE,
+        "--download-archive", str(dest / ".ytv-archive"),
+        "--embed-metadata",
+        "--write-thumbnail", "--convert-thumbnails", "jpg",
+        "--newline",
+        "--",
+        *urls,
+    ]
+
+
+def download_videos(urls: list[str], config: dict, background: bool = True) -> bool:
+    """
+    Download urls into the configured download dir.
+    background=True detaches yt-dlp (survives ytv exiting), logs to
+    downloads.log and sends a desktop notification when done.
+    """
+    dest, err = download_dir(config)
+    if dest is None:
+        warn(err)
+        return False
+    cmd = download_cmd(urls, dest, config)
+    if not background:
+        try:
+            return subprocess.run(cmd).returncode == 0
+        except FileNotFoundError:
+            die("yt-dlp not found. Install: sudo pacman -S yt-dlp")
+
+    n = f"{len(urls)} video(s)"
+    script = '"$@"'
+    if shutil.which("notify-send"):
+        script = (
+            'if "$@"; then notify-send ytv "$YTV_OK"; '
+            'else notify-send -u critical ytv "$YTV_FAIL"; fi'
+        )
+    env = {
+        **os.environ,
+        "YTV_OK":   f"Downloaded {n} to {dest}",
+        "YTV_FAIL": f"Download failed — see {_DOWNLOAD_LOG}",
+    }
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(_DOWNLOAD_LOG, "a") as log:
+            log.write(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S}  {' '.join(urls)}\n")
+            log.flush()
+            subprocess.Popen(
+                ["sh", "-c", script, "sh", *cmd],
+                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True, env=env,
+            )
+    except OSError as e:
+        warn(f"Could not start download: {e}")
+        return False
+    info(f"Downloading {n} to {dest} (log: {_DOWNLOAD_LOG})")
+    return True
+
 # ─── Utilities ───────────────────────────────────────────────────────────────
 
 def eprint(*args, end="\n"):
@@ -1089,6 +1185,10 @@ def show_panel(videos: list[dict], subs: list[dict], config: dict, title: str) -
 
         if not urls:
             break
+
+        if key == "ctrl-d":
+            download_videos(urls, config)
+            continue
 
         if key == "ctrl-y":
             if copy_to_clipboard("\n".join(urls)):
@@ -1180,6 +1280,10 @@ def cmd_browse(args, config: dict, subs: list[dict]) -> None:
         # ── Play / copy ───────────────────────────────────────────────────────
         urls = _urls(lines)
         if not urls:
+            continue
+
+        if key == "ctrl-d":
+            download_videos(urls, config)
             continue
 
         if key == "ctrl-y":
@@ -1338,6 +1442,7 @@ def cmd_show_config(config: dict) -> None:
     print(f"Max videos:    {config['max_videos']}")
     print(f"mpv geometry:  {config['mpv_geometry']}")
     print(f"Quality:       {config['quality']}")
+    print(f"Download dir:  {config.get('download_dir')}")
     print(f"Volume:        {config.get('volume', 100)}")
     print(f"Sticky window: {config.get('sticky_window', False)}")
     config_file = CONFIG_DIR / "config.json"
@@ -1357,6 +1462,7 @@ def main() -> None:
 fzf keybindings (browse / panel):
   ENTER       Play selected video(s) with mpv
   CTRL-A      Audio-only playback
+  CTRL-D      Download to the library folder (download_dir, runs in background)
   CTRL-Y      Copy URL(s) to clipboard
   CTRL-S      Search YouTube (browse mode)
   CTRL-N      More videos from this channel (browse mode)
@@ -1369,6 +1475,7 @@ Examples:
   ytv                      Browse subscription feed
   ytv -r                   Refresh feeds then browse
   ytv search linux tips    Search YouTube
+  ytv download <url>       Download video(s) to download_dir
   ytv add @Fireship        Subscribe to a channel by handle
   ytv add                  Subscribe interactively (search or URL)
   ytv remove               Unsubscribe via fzf picker
@@ -1397,6 +1504,9 @@ Examples:
 
     sub.add_parser("remove",      help="Unsubscribe via fzf picker")
 
+    dp = sub.add_parser("download", help="Download video(s) to download_dir")
+    dp.add_argument("urls", nargs="+", help="Video URL(s)")
+
     ip = sub.add_parser("import", help="Import subscriptions from file")
     ip.add_argument("file", help=".opml / .json / text file")
 
@@ -1419,6 +1529,8 @@ Examples:
     if cmd == "init-config":
         save_default_config()
         return
+    if cmd == "download":
+        sys.exit(0 if download_videos(args.urls, config, background=False) else 1)
 
     subs = load_subs()
 

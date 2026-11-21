@@ -38,6 +38,8 @@ using fzf + mpv. No account, no API key, no ads.
 - ENTER/CTRL-A: play / audio-only — **ytv stays open after play**
 - CTRL-S: search YouTube (opens search panel)
 - CTRL-N: more from channel (opens channel panel via yt-dlp)
+- CTRL-D: download to `download_dir` (detached yt-dlp, notify-send on finish,
+  log `~/.cache/ytv/downloads.log`). Also `ytv download <url>...` (foreground).
 - CTRL-R: refresh feeds
 - CTRL-B: subscribe to channel (in search/channel panels)
 - CTRL-Y: copy URL
@@ -60,7 +62,9 @@ using fzf + mpv. No account, no API key, no ads.
 ## Config
 - Config file: `~/.config/ytv/config.json` (optional, defaults in script)
 - Run `ytv init-config` to generate it
-- Key settings: `mpv_geometry`, `cache_ttl`, `quality`
+- Key settings: `mpv_geometry`, `cache_ttl`, `quality`, `download_dir`, `download_format`
+- `download_dir` is set per-machine in config.json (default `~/Videos/ytv`). Keep
+  personal paths out of README/DEFAULT_CONFIG — the repo is public.
 
 ## Update process
 ```bash
