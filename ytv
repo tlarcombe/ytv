@@ -426,11 +426,22 @@ def get_all_videos(
 
 # ─── yt-dlp helpers (search / channel deep-dive) ─────────────────────────────
 
+def _parse_ts(ts_str: str) -> tuple[float, str]:
+    """yt-dlp epoch timestamp string -> (ts, 'YYYY-MM-DD'); (0.0, '') if unusable."""
+    try:
+        ts = float(ts_str)
+        return ts, datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+    except (ValueError, OSError, OverflowError):
+        return 0.0, ""
+
+
 def search_youtube(query: str, config: dict, limit: int = 25) -> list[dict]:
     """Search YouTube via yt-dlp. Returns video list."""
     cmd = [
         "yt-dlp", "--flat-playlist", f"--playlist-end={limit}",
-        "--print=%(title)s\t%(id)s\t%(channel_id)s\t%(channel)s\t%(view_count)s\t%(webpage_url)s",
+        "--extractor-args=youtubetab:approximate_date",
+        "--print=%(title)s\t%(id)s\t%(channel_id)s\t%(channel)s\t%(view_count)s"
+        "\t%(webpage_url)s\t%(timestamp)s",
         "--quiet", "--no-warnings",
         f"ytsearch{limit}:{query}",
     ]
@@ -447,14 +458,15 @@ def search_youtube(query: str, config: dict, limit: int = 25) -> list[dict]:
         webpage_url = parts[5] if len(parts) > 5 else ""
         if not vid_id or "/shorts/" in webpage_url:
             continue
+        pub_ts, pub_date = _parse_ts(parts[6] if len(parts) > 6 else "")
         videos.append({
             "url":        f"https://www.youtube.com/watch?v={vid_id}",
             "id":         vid_id,
             "title":      title,
             "channel":    channel,
             "channel_id": cid,
-            "date":       "",
-            "ts":         0.0,
+            "date":       pub_date,
+            "ts":         pub_ts,
             "views":      _fmt_views(views) if views else "",
         })
     return videos
@@ -483,13 +495,7 @@ def fetch_channel_yt_dlp(channel_id: str, name: str, limit: int = 30) -> list[di
         webpage_url = parts[5] if len(parts) > 5 else ""
         if not vid_id or "/shorts/" in webpage_url:
             continue
-        pub_ts = 0.0
-        pub_date = ""
-        try:
-            pub_ts   = float(ts_str)
-            pub_date = datetime.fromtimestamp(pub_ts, tz=timezone.utc).strftime("%Y-%m-%d")
-        except (ValueError, OSError, OverflowError):
-            pass
+        pub_ts, pub_date = _parse_ts(ts_str)
         videos.append({
             "url":        f"https://www.youtube.com/watch?v={vid_id}",
             "id":         vid_id,
@@ -682,12 +688,23 @@ _EXTRA_HDR  = (
 )
 
 
+_SHORT_DATE_FMT = "%d/%m/%y"
+
+
+def _short_date(iso_date: str) -> str:
+    """'2026-11-04' -> '04/11/26'; blank-padded to 8 chars if missing/invalid."""
+    try:
+        return datetime.strptime(iso_date, "%Y-%m-%d").strftime(_SHORT_DATE_FMT)
+    except ValueError:
+        return " " * 8
+
+
 def _fmt_line(v: dict) -> str:
-    date    = v.get("date", "")
+    date    = _short_date(v.get("date", ""))
     channel = v.get("channel", "")[:26].ljust(26)
     views   = v.get("views", "").rjust(6) if v.get("views") else " " * 6
     title   = v.get("title", "").replace("\t", " ")
-    display = f"{date}  {channel}  {views}  {title}"
+    display = f"{channel}  {views}  {date}  {title}"
     if v.get("id") in _watched:
         display = f"\033[2m{display}\033[0m"  # dim watched videos
     return "\t".join([
